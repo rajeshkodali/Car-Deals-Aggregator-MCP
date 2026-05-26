@@ -1,0 +1,41 @@
+{
+    "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/registry/main/schemas/server.json",
+    "name": "car-deals-aggregator-mcp",
+    "description": "Aggregate used and new car listings across Cars.com, Autotrader, KBB, CarMax, and Carvana. Flexible filters — only zip is required; make, model, free-text keyword, price, year, mileage, deal rating, and CarFax history (1-Owner, No Accidents, Personal Use) are all optional. Uses direct JSON/GraphQL APIs with Puppeteer fallback.",
+    "vendor": {
+        "name": "Rajesh Kodali",
+        "url": "https://github.com/rkodali"
+    },
+    "sourceUrl": "https://github.com/rkodali/Car-Deals-Aggregator-MCP",
+    "license": "Apache-2.0",
+    "runtime": "node",
+    "packages": {
+        "npm": {
+            "name": "car-deals-aggregator-mcp",
+            "command": "npx",
+            "args": [
+                "-y",
+                "car-deals-aggregator-mcp"
+            ]
+        }
+    },
+    "tools": [
+        {
+            "name": "search_car_deals",
+            "description": "Search car listings by zip (required) plus any optional filters: make, model, free-text keyword, price, year range, mileage, deal rating, condition (new/used), and CarFax history (1-Owner, No Accidents, Personal Use)."
+        }
+    ],
+    "categories": [
+        "automotive",
+        "shopping",
+        "search"
+    ],
+    "tags": [
+        "cars",
+        "deals",
+        "carfax",
+        "automotive",
+        "shopping",
+        "graphql"
+    ]
+}

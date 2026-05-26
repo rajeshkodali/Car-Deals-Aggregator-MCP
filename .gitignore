@@ -1,0 +1,35 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Build / coverage
+dist/
+build/
+coverage/
+.nyc_output/
+*.tsbuildinfo
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+.cursor/
+*.swp
+
+# Local artefacts
+*.log
+*.backup
+tmp/
+.tmp/
+
+# HARs are large captures with potential PII; never commit. Reference paths
+# in CLAUDE.md point to `~/Downloads/*.har` on the maintainer's machine.
+*.har

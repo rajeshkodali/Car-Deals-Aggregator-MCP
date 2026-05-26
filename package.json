@@ -1,0 +1,34 @@
+{
+  "name": "car-deals-aggregator-mcp",
+  "version": "2.0.0",
+  "description": "An MCP server that aggregates car deals from Cars.com, Autotrader, KBB, CarMax, and Carvana. Direct JSON/GraphQL APIs with Puppeteer fallback; flexible filters (only zip required).",
+  "main": "src/server.js",
+  "bin": {
+    "car-deals-aggregator-mcp": "src/server.js"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node -e \"const { scrapeCarscom } = require('./src/scraper.js'); scrapeCarscom({ make: 'Toyota', model: 'Camry' }, 3).then(r => r.forEach(l => console.log(l.format())))\"",
+    "test:unit": "node --test test/*.test.js"
+  },
+  "keywords": [
+    "mcp",
+    "car-deals-aggregator",
+    "scraper",
+    "cars.com",
+    "autotrader",
+    "kbb"
+  ],
+  "author": "Rajesh Kodali",
+  "license": "Apache-2.0",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "puppeteer": "^24.43.1",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}

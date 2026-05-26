@@ -1,0 +1,51 @@
+{
+  "mcpVersion": "1.0.0",
+  "id": "rkodali/Car-Deals-Aggregator-MCP",
+  "name": "car-deals-aggregator-mcp",
+  "displayName": "Car Deals Aggregator (MCP)",
+  "version": "2.0.0",
+  "description": "Aggregate used and new car listings across Cars.com, Autotrader, KBB, CarMax, and Carvana. Direct JSON/GraphQL API calls with Puppeteer fallback. Flexible filters — search by zip, make, model, free-text keyword, price, year, mileage, deal rating, body style, fuel type, or CarFax history.",
+  "author": "Rajesh Kodali",
+  "homepage": "https://github.com/rkodali/Car-Deals-Aggregator-MCP",
+  "icon": "assets/icon.svg",
+  "license": "Apache-2.0",
+  "entry": {
+    "command": "node",
+    "args": ["src/server.js"]
+  },
+  "ports": [
+    {
+      "name": "http",
+      "protocol": "http",
+      "port": 3000
+    }
+  ],
+  "permissions": [
+    "network",
+    "filesystem"
+  ],
+  "tags": ["scraper", "cars", "mcp", "search", "graphql"],
+  "schema": {
+    "tool": "search_car_deals",
+    "parameters": {
+      "zip": { "type": "string", "required": true, "description": "ZIP code for location-based search" },
+      "make": { "type": "string", "description": "Optional. Car manufacturer (Toyota, Honda, Ford, ...)" },
+      "model": { "type": "string", "description": "Optional. Car model (Camry, Civic, F-150, ...)" },
+      "keyword": { "type": "string", "description": "Optional. Free-text keyword (e.g. hybrid, AWD, leather)" },
+      "yearMin": { "type": "integer", "description": "Optional. Minimum model year" },
+      "yearMax": { "type": "integer", "description": "Optional. Maximum model year" },
+      "priceMax": { "type": "integer", "description": "Optional. Maximum price in dollars" },
+      "mileageMax": { "type": "integer", "description": "Optional. Maximum mileage" },
+      "searchRadius": { "type": "integer", "description": "Optional. Search radius in miles (default 50)" },
+      "condition": { "type": "string", "enum": ["new", "used"], "description": "Optional. New or used. Default: used" },
+      "dealRating": { "type": "string", "enum": ["great", "good", "fair"], "description": "Optional. Filter by deal rating" },
+      "oneOwner": { "type": "boolean", "description": "Optional. CARFAX 1-Owner only" },
+      "noAccidents": { "type": "boolean", "description": "Optional. No reported accidents" },
+      "personalUse": { "type": "boolean", "description": "Optional. Personal use only (no rental/fleet)" },
+      "maxResults": { "type": "integer", "description": "Optional. Max results per source (default 10)" },
+      "bodyStyle": { "type": "string", "enum": ["sedan", "suv", "truck", "coupe", "hatchback", "convertible", "wagon", "minivan", "van"], "description": "Optional. Vehicle body style." },
+      "fuelType": { "type": "string", "enum": ["gas", "hybrid", "ev", "plugin_hybrid", "diesel"], "description": "Optional. Fuel/powertrain type." },
+      "sources": { "type": "array", "items": { "type": "string" }, "description": "Optional. Sources to query: cars.com, autotrader, kbb, carmax, carvana. Default: cars.com + autotrader (KBB / CarMax / Carvana are opt-in)." }
+    }
+  }
+}

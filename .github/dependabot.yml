@@ -1,0 +1,63 @@
+# Dependabot configuration.
+# Reference: https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# Strategy: weekly grouped PRs for security and patch/minor updates only.
+# Major-version bumps almost always need code changes; we don't ask
+# Dependabot to file PRs that can't merge cleanly.
+version: 2
+
+updates:
+  # npm runtime + dev dependencies.
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - javascript
+    commit-message:
+      prefix: "deps"
+      include: scope
+
+    # Skip major bumps. Use a manual `npm outdated` + audit pass for
+    # intentional majors (puppeteer, @modelcontextprotocol/sdk, etc).
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+    # Group remaining patch+minor updates into one PR per ecosystem so
+    # we don't get N PRs the same morning.
+    groups:
+      patch-and-minor:
+        update-types:
+          - "patch"
+          - "minor"
+
+  # GitHub Actions used in workflows.
+  # Action major-version bumps are usually safe (well-maintained,
+  # semver-honoring), so we DO accept them here — different policy
+  # from npm deps because actions are CI-time only, not runtime.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: "ci"
+      include: scope
+    groups:
+      actions-all:
+        update-types:
+          - "patch"
+          - "minor"
+          - "major"

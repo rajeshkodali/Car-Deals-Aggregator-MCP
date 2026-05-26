@@ -1,0 +1,51 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly Monday 09:00 UTC
+    - cron: '0 9 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Top-level least-privilege. The analyze job widens to security-events:write
+# only where it needs to upload SARIF results.
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ['javascript-typescript']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9e0d7b8d25671d64c341c19c0152d693099fb5ba  # v4.35.5
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-and-quality
+
+      # JS/TS doesn't need a build step for CodeQL; autobuild is a
+      # no-op for interpreted languages but kept here so the workflow
+      # diff stays symmetric with the reference repo.
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@9e0d7b8d25671d64c341c19c0152d693099fb5ba  # v4.35.5
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@9e0d7b8d25671d64c341c19c0152d693099fb5ba  # v4.35.5
+        with:
+          category: "/language:${{ matrix.language }}"
