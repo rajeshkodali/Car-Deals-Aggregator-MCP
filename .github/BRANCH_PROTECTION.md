@@ -15,6 +15,7 @@ The CI workflow names that should be marked **required** before merging:
 | `lint`                  | `.github/workflows/ci.yml`          |
 | `npm audit`             | `.github/workflows/ci.yml`          |
 | `CodeQL`                | `.github/workflows/codeql.yml`      |
+| `njsscan`               | `.github/workflows/njsscan.yml`     |
 | `semgrep`               | `.github/workflows/semgrep.yml`     |
 
 Each of these must complete successfully on the PR's head commit before
@@ -53,6 +54,7 @@ gh api -X PUT "repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/bran
       "lint",
       "npm audit",
       "CodeQL",
+      "njsscan",
       "semgrep"
     ]
   },
@@ -75,7 +77,7 @@ JSON
 
 If you're the sole maintainer, set
 `required_approving_review_count` to `0` — the other gates (CI, CodeQL,
-Semgrep, audit) still apply.
+njsscan, semgrep, audit) still apply.
 
 ## Verifying the rule is live
 
@@ -84,4 +86,4 @@ gh api "repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/branches/ma
   | jq '{checks: .required_status_checks.contexts, linear: .required_linear_history.enabled, force: .allow_force_pushes.enabled}'
 ```
 
-Expected output: the 6 check contexts, `linear: true`, `force: false`.
+Expected output: the 7 check contexts, `linear: true`, `force: false`.
