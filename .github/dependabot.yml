@@ -23,6 +23,12 @@ updates:
       prefix: "deps"
       include: scope
 
+    # Let freshly-published versions soak before Dependabot pulls them,
+    # so a compromised release can't land the day it's pushed. 7 days for
+    # runtime deps — cheap insurance against a supply-chain day-zero.
+    cooldown:
+      default-days: 7
+
     # Skip major bumps. Use a manual `npm outdated` + audit pass for
     # intentional majors (puppeteer, @modelcontextprotocol/sdk, etc).
     ignore:
@@ -55,6 +61,13 @@ updates:
     commit-message:
       prefix: "ci"
       include: scope
+
+    # Same 7-day soak as npm. Actions are CI-time only, but they run with
+    # write-ish tokens, and the semgrep supply-chain rule wants >=7 here
+    # too — matching keeps the policy simple and the scan green.
+    cooldown:
+      default-days: 7
+
     groups:
       actions-all:
         update-types:
