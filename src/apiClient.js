@@ -729,6 +729,11 @@ module.exports = {
     getCarscomApiKey,
     AkamaiBlockError,
     isAkamaiBlock,
+    // Exported so scraper.js (CarGurus) can reuse the same normalization
+    // vocabulary instead of duplicating it — these two are pure functions
+    // with no fetch/puppeteer dependency either way.
+    normalizeFuelType,
+    normalizeDriveType,
     // Re-exported via module.exports so tests can stub distanceMiles without
     // launching real HTTP calls. Same pattern as getCarscomApiKey.
     _zipDistance: zipDistance
