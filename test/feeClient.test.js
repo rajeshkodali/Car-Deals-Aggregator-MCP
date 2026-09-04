@@ -17,6 +17,12 @@ function withFetchStub(stub, fn) {
     global.fetch = stub;
     return Promise.resolve(fn()).finally(() => { global.fetch = prev; });
 }
+// Exact hostname match, not a bare substring check — a `.includes('zip-tax.com')`
+// check would also match e.g. `https://evil.com/zip-tax.com` (CodeQL flags this
+// pattern as "Incomplete URL substring sanitization" even in test fixtures).
+function isZipTaxUrl(url) {
+    return new URL(String(url)).hostname === 'api.zip-tax.com';
+}
 // Tests exercise both the zip.tax path and the TaxJar fallback, gated on
 // ZIP_TAX_API_KEY. Save/restore around every test so a real key present in
 // the runner's own shell env (or lack thereof) can't make results
@@ -212,6 +218,73 @@ test('lookupSalesTax prefers zip.tax when ZIP_TAX_API_KEY is set, sends X-API-KE
         assert.ok(captured.url.startsWith('https://api.zip-tax.com/request/v60?'));
         assert.ok(captured.url.includes('postalcode=98033'));
         assert.equal(captured.opts.headers['X-API-KEY'], 'test-zip-tax-key');
+        assert.equal(captured.opts.redirect, 'error', 'must refuse to replay X-API-KEY across a redirect');
+    });
+});
+
+for (const badTaxSales of [null, false, '', '   ', {}, []]) {
+    test(`lookupSalesTax falls back to TaxJar when zip.tax taxSales is ${JSON.stringify(badTaxSales)}`, async () => {
+        await withZipTaxKey('test-zip-tax-key', async () => {
+            const fc = load();
+            fc._clearCache();
+            let calls = 0;
+            await withFetchStub(async (url) => {
+                calls += 1;
+                if (isZipTaxUrl(url)) {
+                    return fetchResp({
+                        body: {
+                            rCode: 100,
+                            results: [{ geoState: 'WA', geoCity: 'KIRKLAND', geoCounty: 'KING', taxSales: badTaxSales }]
+                        }
+                    });
+                }
+                return fetchResp({ body: KIRKLAND_RESPONSE });
+            }, async () => {
+                const out = await fc.lookupSalesTax('98033');
+                assert.equal(out.source, 'taxjar.com calculator widget');
+                assert.equal(out.combinedRate, 0.104, 'must not silently cache a zero rate from the malformed response');
+            });
+            assert.equal(calls, 2, 'tried zip.tax then fell back to TaxJar');
+        });
+    });
+}
+
+test('lookupSalesTax accepts a numeric-string taxSales from zip.tax', async () => {
+    await withZipTaxKey('test-zip-tax-key', async () => {
+        const fc = load();
+        fc._clearCache();
+        await withFetchStub(async (url) => {
+            if (isZipTaxUrl(url)) {
+                return fetchResp({
+                    body: {
+                        rCode: 100,
+                        results: [{ geoState: 'WA', geoCity: 'KIRKLAND', geoCounty: 'KING', taxSales: '0.103' }]
+                    }
+                });
+            }
+            return fetchResp({ body: KIRKLAND_RESPONSE });
+        }, async () => {
+            const out = await fc.lookupSalesTax('98033');
+            assert.equal(out.source, 'zip-tax.com');
+            assert.equal(out.combinedRate, 0.103);
+        });
+    });
+});
+
+test('lookupSalesTax falls back to TaxJar when zip.tax fetch refuses a redirect', async () => {
+    await withZipTaxKey('test-zip-tax-key', async () => {
+        const fc = load();
+        fc._clearCache();
+        let calls = 0;
+        await withFetchStub(async (url) => {
+            calls += 1;
+            if (isZipTaxUrl(url)) throw new TypeError('fetch failed: unexpected redirect');
+            return fetchResp({ body: KIRKLAND_RESPONSE });
+        }, async () => {
+            const out = await fc.lookupSalesTax('98033');
+            assert.equal(out.source, 'taxjar.com calculator widget');
+        });
+        assert.equal(calls, 2, 'tried zip.tax then fell back to TaxJar');
     });
 });
 
@@ -222,7 +295,7 @@ test('lookupSalesTax falls back to TaxJar when zip.tax rCode is not 100', async 
         let calls = 0;
         await withFetchStub(async (url) => {
             calls += 1;
-            if (String(url).includes('zip-tax.com')) return fetchResp({ body: { rCode: 400, message: 'bad key' } });
+            if (isZipTaxUrl(url)) return fetchResp({ body: { rCode: 400, message: 'bad key' } });
             return fetchResp({ body: KIRKLAND_RESPONSE });
         }, async () => {
             const out = await fc.lookupSalesTax('98033');
@@ -238,7 +311,7 @@ test('lookupSalesTax falls back to TaxJar when zip.tax HTTP fails', async () => 
         const fc = load();
         fc._clearCache();
         await withFetchStub(async (url) => {
-            if (String(url).includes('zip-tax.com')) return fetchResp({ status: 500, body: 'down' });
+            if (isZipTaxUrl(url)) return fetchResp({ status: 500, body: 'down' });
             return fetchResp({ body: KIRKLAND_RESPONSE });
         }, async () => {
             const out = await fc.lookupSalesTax('98033');
@@ -254,7 +327,7 @@ test('lookupSalesTax does not call zip.tax when ZIP_TAX_API_KEY is unset', async
         let calls = 0;
         await withFetchStub(async (url) => {
             calls += 1;
-            assert.ok(!String(url).includes('zip-tax.com'), 'should not call zip.tax without a key');
+            assert.ok(!isZipTaxUrl(url), 'should not call zip.tax without a key');
             return fetchResp({ body: KIRKLAND_RESPONSE });
         }, async () => {
             const out = await fc.lookupSalesTax('98033');

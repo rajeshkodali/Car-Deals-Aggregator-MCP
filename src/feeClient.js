@@ -29,7 +29,11 @@ const cache = new Map(); // zip -> result
 async function fetchZipTax(zip, apiKey) {
     const url = `https://api.zip-tax.com/request/v60?${new URLSearchParams({ postalcode: zip })}`;
     const res = await fetchWithTimeout(url, {
-        headers: { 'X-API-KEY': apiKey }
+        headers: { 'X-API-KEY': apiKey },
+        // zip.tax is called with a credential header; refuse to follow a redirect
+        // rather than replay X-API-KEY to whatever host it points to (Undici only
+        // strips Authorization on cross-origin redirects, not custom headers).
+        redirect: 'error'
     }, { timeoutMs: 8_000, label: 'zip.tax' });
     if (res.status !== 200) throw new Error(`zip.tax HTTP ${res.status}`);
     const text = await res.text();
@@ -40,7 +44,14 @@ async function fetchZipTax(zip, apiKey) {
     const r = Array.isArray(data.results) ? data.results[0] : null;
     if (!r) throw new Error('zip.tax response missing results');
 
-    const combined = Number(r.taxSales);
+    // Number(null|false|'') is 0, which is finite — that would silently coerce a
+    // malformed response into a real (zero) rate instead of falling back to
+    // TaxJar. Only accept an actual number or a non-blank string before coercing.
+    const rawTaxSales = r.taxSales;
+    const looksNumeric = typeof rawTaxSales === 'number'
+        || (typeof rawTaxSales === 'string' && rawTaxSales.trim() !== '');
+    if (!looksNumeric) throw new Error('zip.tax taxSales not numeric');
+    const combined = Number(rawTaxSales);
     if (!Number.isFinite(combined)) throw new Error('zip.tax taxSales not numeric');
 
     return {
