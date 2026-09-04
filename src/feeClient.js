@@ -60,10 +60,10 @@ async function fetchZipTax(zip, apiKey) {
         city: r.geoCity || null,
         county: r.geoCounty || null,
         combinedRate: combined,
-        stateRate: Number(r.stateSalesTax) || 0,
-        countyRate: Number(r.countySalesTax) || 0,
-        cityRate: Number(r.citySalesTax) || 0,
-        districtRate: Number(r.districtSalesTax) || 0,
+        stateRate: Number(r.rateState) || 0,
+        countyRate: Number(r.rateCounty) || 0,
+        cityRate: Number(r.rateCity) || 0,
+        districtRate: Number(r.rateAdditional) || 0,
         source: 'zip-tax.com'
     };
 }

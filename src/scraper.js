@@ -12,6 +12,13 @@ const cargurusReference = require('./cargurusReference.js');
 // apiClient.js itself has no puppeteer dependency, so this doesn't pull
 // puppeteer in anywhere it wasn't already.
 const { normalizeFuelType, normalizeDriveType } = require('./apiClient.js');
+const { parsePrice } = require('./loanCalculator.js');
+
+function parseMileageStr(s) {
+    if (!s) return null;
+    const digits = String(s).replace(/[^\d]/g, '');
+    return digits ? Number(digits) : null;
+}
 
 /**
  * Launch browser with stealth settings.
@@ -416,6 +423,13 @@ async function scrapeKBB(params, maxResults = 20) {
  *   - When a listing is nationwide-shippable, CarGurus's location line
  *     shows "Price includes $X shipping" instead of a distance. We surface
  *     that as-is in `location` — it's the real per-listing figure.
+ *   - make/model, priceMax, and mileageMax are enforced (make/model via
+ *     resolveMakeModel + a post-filter on the tile's own Make/Model fields;
+ *     price/mileage via a post-filter on the tile's price/mileage text,
+ *     since the CarGurus search URL's real query-param names for those
+ *     aren't verified). `condition`, `bodyStyle`, `fuelType`, `dealRating`,
+ *     and `keyword` are NOT wired through at all for this source yet — same
+ *     "documented gap" posture as e.g. dealRating=fair on Autotrader/KBB.
  */
 async function scrapeCarGurus(params, maxResults = 20) {
     const listings = [];
@@ -499,7 +513,34 @@ async function scrapeCarGurus(params, maxResults = 20) {
             return results;
         });
 
-        for (const item of rawListings.slice(0, maxResults)) {
+        // resolveMakeModel silently broadens the query on a lookup miss —
+        // e.g. an unresolved model falls back to a make-only search, and an
+        // unresolved make falls back to no makeModelTrimPaths at all (see
+        // its own header comment). Post-filter on the tile's own Make/Model
+        // fields (real per-listing data, not inferred) so a caller-specified
+        // make/model that CarGurus's ID index doesn't recognize can't return
+        // unrelated vehicles. Same normalize() used to build that index, so
+        // spacing/hyphen/case variants (e.g. "Ioniq 5" vs "Ioniq5") still match.
+        const wantMake = params.make ? cargurusReference.normalize(params.make) : null;
+        const wantModel = params.model ? cargurusReference.normalize(params.model) : null;
+        const filtered = rawListings.filter(item => {
+            if (wantMake && cargurusReference.normalize(item.make) !== wantMake) return false;
+            if (wantModel && cargurusReference.normalize(item.model) !== wantModel) return false;
+            // priceMax/mileageMax aren't wired into the CarGurus search URL
+            // (unverified param names) — post-filter on the tile's own
+            // price/mileage text instead of returning them unfiltered.
+            if (params.priceMax) {
+                const price = parsePrice(item.price);
+                if (price != null && price > params.priceMax) return false;
+            }
+            if (params.mileageMax) {
+                const mileage = parseMileageStr(item.mileage);
+                if (mileage != null && mileage > params.mileageMax) return false;
+            }
+            return true;
+        });
+
+        for (const item of filtered.slice(0, maxResults)) {
             const title = [item.year, item.make, item.model, item.trim].filter(Boolean).join(' ') || null;
             const location = [item.locationCity, item.locationDetail].filter(Boolean).join(' — ') || null;
             listings.push(new CarListing({

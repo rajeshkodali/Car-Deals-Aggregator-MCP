@@ -184,13 +184,13 @@ const ZIPTAX_KIRKLAND_RESPONSE = {
     results: [
         {
             geoPostalCode: '98033', geoCity: 'KIRKLAND', geoCounty: 'KING', geoState: 'WA',
-            taxSales: 0.103, taxUse: 0.103, stateSalesTax: 0.065, citySalesTax: 0,
-            countySalesTax: 0.038, districtSalesTax: 0
+            taxSales: 0.103, taxUse: 0.103, rateState: 0.065, rateCity: 0,
+            rateCounty: 0.038, rateAdditional: 0
         },
         {
             geoPostalCode: '98033', geoCity: 'REDMOND', geoCounty: 'KING', geoState: 'WA',
-            taxSales: 0.103, taxUse: 0.103, stateSalesTax: 0.065, citySalesTax: 0,
-            countySalesTax: 0.038, districtSalesTax: 0
+            taxSales: 0.103, taxUse: 0.103, rateState: 0.065, rateCity: 0,
+            rateCounty: 0.038, rateAdditional: 0
         }
     ]
 };
