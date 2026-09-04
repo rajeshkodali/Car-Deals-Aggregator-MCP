@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-- `npm run test:unit` — full offline `node:test` suite (~230ms, 125 tests). Use this for CI and local iteration.
+- `npm run test:unit` — full offline `node:test` suite (~230ms, 177 tests). Use this for CI and local iteration.
 - `node --test test/apiClient.test.js` — run a single test file. Append `--test-name-pattern="<regex>"` to scope to one test.
 - `npm start` — boot the MCP server over stdio (entry: `src/server.js`).
 - `npm test` — **live** Puppeteer smoke against Cars.com. Hits the network, slow, do not run in CI.
@@ -17,7 +17,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 2. One URL per car — if the same listing appears on multiple sources, pick one: Cars.com > Autotrader > KBB. Never duplicate rows or show two links for the same car.
 3. Sanity check: if a user reading in a plain monospace terminal would only see the word "Link", you've done it wrong.
 
-**Default search behavior:** Always include all 5 sources (`cars.com`, `autotrader`, `kbb`, `carmax`, `carvana`) and set `maxResults` ≥ 50 unless the user says otherwise.
+**Default search behavior:** Always include all 6 sources (`cars.com`, `autotrader`, `kbb`, `carmax`, `carvana`, `cargurus`) and set `maxResults` ≥ 50 unless the user says otherwise.
 
 ## Architecture (v3)
 
@@ -26,15 +26,15 @@ Two-tier strategy per source:
 1. **`src/apiClient.js` — direct `fetch` to internal JSON/GraphQL APIs.** Fast, structured, no browser. Tried first.
 2. **`src/scraper.js` — Puppeteer + stealth.** Fallback when (1) errors or returns 0 listings.
 
-`src/server.js` orchestrates: `searchCarscom` / `searchAutotrader` / `searchKBB` / `searchCarmax` / `searchCarvana`. The first three try fetch first and fall through to Puppeteer **only on a thrown error** (HTTP non-200, AkamaiBlockError, schema mismatch, or timeout). A clean 200 with zero results does NOT trigger fallback — that just spends a Puppeteer launch on a query the user phrased narrowly. **CarMax** tries its JSON API first, falls through to a *no-Puppeteer* HTML-extract fallback (`fetchCarmaxFromHtml`) on the same error-only conditions — see CarMax section. **Carvana** is API-only; the SRP HTML page is Cloudflare-gated, so a fallback would require Puppeteer and hasn't been built. KBB and Autotrader share Cox Automotive's `/rest/lsc/listing` endpoint under different hosts (see KBB section below). **Result dedup is scoped to Autotrader ↔ KBB only** — same `listingId` from both is collapsed to one (Autotrader wins). Cars.com, CarMax, and Carvana all have independent inventory and are never deduped against anything. Cars.com uses `/vehicledetail/{id}/` URLs which don't match the Cox `listingId=` pattern, so they pass through untouched.
+`src/server.js` orchestrates: `searchCarscom` / `searchAutotrader` / `searchKBB` / `searchCarmax` / `searchCarvana` / `searchCarGurus`. The first three try fetch first and fall through to Puppeteer **only on a thrown error** (HTTP non-200, AkamaiBlockError, schema mismatch, or timeout). A clean 200 with zero results does NOT trigger fallback — that just spends a Puppeteer launch on a query the user phrased narrowly. **CarMax** tries its JSON API first, falls through to a *no-Puppeteer* HTML-extract fallback (`fetchCarmaxFromHtml`) on the same error-only conditions — see CarMax section. **Carvana** is API-only; the SRP HTML page is Cloudflare-gated, so a fallback would require Puppeteer and hasn't been built. **CarGurus** is the mirror image of Carvana: Puppeteer-only, no fetch tier at all — every cargurus.com endpoint (reference lookups and the SRP page itself) sits behind a DataDome TLS/HTTP2-fingerprint block that rejects plain Node `fetch` outright, so there's nothing to fall back *from* — see CarGurus section below. KBB and Autotrader share Cox Automotive's `/rest/lsc/listing` endpoint under different hosts (see KBB section below). **Result dedup is scoped to Autotrader ↔ KBB only** — same `listingId` from both is collapsed to one (Autotrader wins). Cars.com, CarMax, Carvana, and CarGurus all have independent inventory and are never deduped against anything. Cars.com uses `/vehicledetail/{id}/` URLs which don't match the Cox `listingId=` pattern, so they pass through untouched.
 
 ### Per-source CARFAX-filter capability
 
-| Filter        | Cars.com   | Autotrader | KBB | CarMax              | Carvana |
-|---------------|------------|------------|-----|---------------------|---------|
-| `oneOwner`    | ✗ (note)   | ✓          | ✓   | ✓ (`singleOwner`)   | ✗       |
-| `noAccidents` | ✗ (note)   | ✓          | ✓   | ✗                   | ✗       |
-| `personalUse` | ✓          | ✓          | ✓   | ✗                   | ✗       |
+| Filter        | Cars.com   | Autotrader | KBB | CarMax              | Carvana | CarGurus |
+|---------------|------------|------------|-----|---------------------|---------|----------|
+| `oneOwner`    | ✗ (note)   | ✓          | ✓   | ✓ (`singleOwner`)   | ✗       | ✗        |
+| `noAccidents` | ✗ (note)   | ✓          | ✓   | ✗                   | ✗       | ✗        |
+| `personalUse` | ✓          | ✓          | ✓   | ✗                   | ✗       | ✗        |
 
 When the caller passes a CARFAX filter and a source can't enforce it per-listing, `server.js` **skips that source entirely** rather than returning unfiltered rows that would render with badges they can't back up. The rendered output surfaces a one-line caveat (`> carvana: oneOwner=true not enforceable`). Cox endpoints (Autotrader/KBB) post-filter on `vhrPreview`.
 
@@ -48,6 +48,7 @@ Each source mapper populates a normalized `fuelType` on `CarListing` from source
 - Autotrader / KBB (Cox) → `fuelType.code` or `fuelType.name`
 - CarMax → `engineType` or `fuelType`
 - Carvana → `fuelType`
+- CarGurus → the SRP tile's `<dl>` "Fuel type" value (and "Drivetrain" feeds `normalizeDriveType()` the same way)
 
 `normalizeFuelType()` collapses these to one of `electric | plug_in_hybrid | hybrid | gas | diesel | flex_fuel | hydrogen | null`. The EV surcharge is applied per-listing: only `electric` and `plug_in_hybrid` rows get the `EV surcharge $X/yr` line in the monthly cost. Listings whose source didn't expose fuelType (`null`) fall back to the request-level `fuelType` hint with the same per-listing label so the user sees the imprecision.
 
@@ -62,7 +63,7 @@ Results bundle these into a per-listing total: `loan + insurance + monthly fees`
 
 `search_car_deals` — only `zip` is required. Everything else is optional.
 
-**Listing filters:** `make`, `model`, `keyword` (free text), `yearMin/Max`, `priceMax`, `mileageMax`, `searchRadius`, `condition` (`new`/`used`), `dealRating` (`great`/`good`/`fair`), `oneOwner`, `noAccidents`, `personalUse`, `bodyStyle` (`sedan`/`suv`/`truck`/`coupe`/`hatchback`/`convertible`/`wagon`/`minivan`/`van`), `fuelType` (`gas`/`hybrid`/`ev`/`plugin_hybrid`/`diesel`), `maxResults`, `sources`. Default sources: `['cars.com', 'autotrader']`. KBB, CarMax, and Carvana are opt-in.
+**Listing filters:** `make`, `model`, `keyword` (free text), `yearMin/Max`, `priceMax`, `mileageMax`, `searchRadius`, `condition` (`new`/`used`), `dealRating` (`great`/`good`/`fair`), `oneOwner`, `noAccidents`, `personalUse`, `bodyStyle` (`sedan`/`suv`/`truck`/`coupe`/`hatchback`/`convertible`/`wagon`/`minivan`/`van`), `fuelType` (`gas`/`hybrid`/`ev`/`plugin_hybrid`/`diesel`), `maxResults`, `sources`. Default sources: `['cars.com', 'autotrader']`. KBB, CarMax, Carvana, and CarGurus are opt-in.
 
 > **dealRating coverage:** `great` and `good` filter on all three sources (Cars.com via `deal_ratings` GraphQL filter; Autotrader + KBB via Cox `dealType=greatprice|goodprice` plus a defensive post-filter on the per-listing rating). `fair` only filters on Cars.com — Cox's JS bundle declares only `greatprice` and `goodprice` as filter values, so on Autotrader/KBB we silently no-op rather than send a value the API ignores. Per-listing dealRating still appears in the result text.
 
@@ -159,6 +160,50 @@ The query params and most of the response shape are identical to Autotrader. `sr
 `vhrPreview` works identically (`ONE_OWNER`, `NO_ACCIDENTS_REPORTED`, `PERSONAL_USE`, etc.) — same post-filter logic. Listing URL is constructed the same way: `https://www.kbb.com/cars-for-sale/vehicledetails.xhtml?listingId=${l.id}`.
 
 The Puppeteer fallback (`scrapeKBB` in `src/scraper.js`) is still wired in case the Cox endpoint blocks or schemas drift.
+
+### CarGurus (2026-09-04)
+
+`GET https://www.cargurus.com/search?makeModelTrimPaths={makeId}/{modelId}&zip={zip}&distance={miles}&sortType=PRICE&sortDirection=ASC&startYear=...&endYear=...`
+
+CarGurus's search page is unauthenticated and cookie-less — no business/affiliate approval needed, contrary to an earlier (pre-HAR) assumption. But every cargurus.com endpoint sits behind **DataDome**, a TLS/HTTP2-fingerprint-level bot block: plain Node `fetch`/`undici` gets HTTP 406 with an empty body, even with headers copied verbatim from a real captured browser session. Puppeteer + `puppeteer-extra-plugin-stealth` gets through cleanly. Unlike every other source in this project, **there is no fetch tier at all** — `scrapeCarGurus` in `src/scraper.js` is the only code path, architecturally the mirror image of Carvana (fetch-only, no Puppeteer) on the opposite end of the fetch/Puppeteer spectrum.
+
+- Discovered from HAR: `/Users/rkodali/Downloads/www.cargurus.com_Archive [26-09-04 06-15-16].har`.
+
+#### Make/model reference lookup (`src/cargurusReference.js`)
+
+`makeModelTrimPaths` takes opaque IDs (`m28` for Hyundai, `d3120` for Ioniq 5) — no algorithmic name→ID mapping, same situation as Cox's make/model codes. Resolved via:
+
+```
+GET /Cars/api/1.0/carselector/listMakes.action?searchType=USED
+GET /Cars/api/1.0/carselector/listModels.action?searchType=USED&makeId={id}
+```
+
+These two endpoints are behind the same DataDome block as the SRP page, so `cargurusReference.resolveMakeModel(page, make, model)` takes an already-open Puppeteer `page` (reusing the scrape's own browser session instead of paying for a second launch) rather than doing its own `fetch`, unlike `coxReference.js`. Non-throwing on a miss — either id comes back `null` and the caller proceeds with a make-only or unfiltered search. Makes are cached for the process lifetime; models are cached per makeId.
+
+#### SRP page is server-rendered structured HTML, not JSON
+
+The Remix-SSR page embeds real listing data directly as markup — no JS state blob to parse. Each tile is `[data-testid="srp-listing-tile"]`, containing an `<a data-testid="tile-link">` and a `<dl>` of dt/dd pairs (Year, Make, Model, Body type, Drivetrain, Engine, Fuel type, Mileage, VIN, etc.) — a materially more reliable extraction target than the free-text regex scraping the other three Puppeteer scrapers in `scraper.js` have to do. Other selectors used: `[data-cg-ft="vehicle"]` (trim, via `title` attr), `[data-testid="srp-tile-price"]`, `[data-testid="srp-tile-deal-rating"]`, `[data-testid="LocationSection-secondLine"]`.
+
+#### Nationwide-shippable listings show a shipping fee instead of distance
+
+`LocationSection-secondLine` normally shows "X mi away", but for listings CarGurus will ship nationwide it shows **"Price includes $X shipping"** (e.g. `$1,265`, `$1,494`, `$1,640`, `$1,500`, `$2,875` seen live) instead, alongside a `firstLine` of "Home delivery from {city}, {state}" rather than the dealer's city. `scrapeCarGurus` surfaces both lines joined in the listing's `location` field (e.g. `"Home delivery from Oak Forest, IL — Price includes $1,500 shipping"`) — no separate shipping-fee field, since the text itself already communicates the number to the user.
+
+#### `LocationSection` hydrates asynchronously, per tile (known flake)
+
+Live-verified 2026-09-04: the location section (both "X mi away" and the shipping-fee text) renders in after the tile itself paints, and appears to hydrate lazily per-tile rather than all at once — even after `page.waitForFunction` confirms the *first* tile's location section exists, other tiles further down the SRP can still come back with `location: null`, and which tiles are affected varies run-to-run. `scrapeCarGurus` waits (bounded, 8s, fail-open) for the first tile to hydrate before scraping, which helps but doesn't fully close the race. Same fragility class as the documented Cars.com `x-api-key` cold-start race — not fully solved, listings still render fine, just occasionally missing the location line. See Known issues.
+
+#### No per-listing CARFAX-equivalent data
+
+The SRP tile carries no owner-history/accident field. All three CARFAX flags (`isOneOwner`, `noAccidents`, `personalUse`) are hardcoded `false` for every CarGurus listing, same posture as Carvana. Note the real site's `/search` URL *does* accept a `vehicleHistoryOptions` param (`CLEAN_TITLE,SINGLE_OWNER,NON_FLEET`, seen in the HAR) — deliberately **not implemented**: `CLEAN_TITLE`'s rendered UI chip read "No accidents reported" (not the "clean title" semantic the token name suggests), and there's no per-listing field to verify the filter's effect after the fact. Needs live verification before trusting; see Known issues.
+
+#### Dealer name is sponsored-tile-only
+
+Non-sponsored SRP tiles have no dealer-name element at all. Dealer name only appears via a `img[class*="_dealerLogoSized"]` `alt` attribute, and only on sponsored tiles (verified empirically against multiple tiles in the captured HTML).
+
+#### Other limitations
+
+- **Single-page only.** No pagination on the SRP; ~20-24 tiles per query, matching the fallback-duty posture of CarMax's HTML extractor.
+- **Canonical URL construction:** `href` on `tile-link` carries tracking query params — stripped via `` `https://www.cargurus.com${item.href.split('?')[0]}` ``.
 
 ## Insurance estimates (2026-05-15)
 
@@ -263,6 +308,10 @@ This section is the canonical reference for which endpoints work from Node's `fe
 
 - Same Cox endpoint as Autotrader, different host. **Not blocked from Node fetch** in our tests. Same posture as Autotrader: detect via the `page unavailable` body string, not status code.
 
+### CarGurus (2026-09-04)
+
+- **Blocked at the TLS/HTTP2-fingerprint level (DataDome)** — HTTP 406 with an empty body from plain Node `fetch`, on every endpoint tested (`listMakes.action`, `listModels.action`, the `/search` SRP page), even with headers copied verbatim from a real captured Firefox session. Distinct from both Autotrader's Akamai (200-with-HTML-sentinel) and Cars.com's plain 403 — this is a fingerprint-level block that header tuning can't fix. Puppeteer + `puppeteer-extra-plugin-stealth` gets through cleanly on all of them. No fetch tier exists for this source at all (see Architecture).
+
 ### CarMax search API (2026-05-17)
 
 - `GET https://www.carmax.com/cars/api/search/run?uri=...&zipCode=...&take=...&sort=bestmatch&shipping=-1`
@@ -355,8 +404,9 @@ Cars.com 403 is a normal status check.
 - `src/feeData.js` — static state-level tables: EV annual surcharge and registration estimate. Source URLs in the file header.
 - `src/loanCalculator.js` — pure `monthlyPayment(...)`, `parsePrice(...)`, and `totalCostBreakdown(...)` (the integration helper that finances tax into principal and amortizes annual fees).
 - `src/zipDistance.js` — `getZipCoords(zip)` + `distanceMiles(zipA, zipB)` against Zippopotam.us (free, no auth, undocumented). In-memory cache for the process lifetime. Used by `fetchCarscom` to post-filter out-of-radius listings. Fail-open: lookup failures keep the listing rather than drop it.
-- `src/scraper.js` — Puppeteer + `puppeteer-extra-plugin-stealth` HTML scrapers for Cars.com, Autotrader, KBB. Each call launches its own browser. Exports `CarListing` class.
-- `test/` — `node:test` suite, runs offline, ~165ms. See "Tests" below.
+- `src/scraper.js` — Puppeteer + `puppeteer-extra-plugin-stealth` HTML scrapers for Cars.com, Autotrader, KBB, and CarGurus (`scrapeCarGurus`, Puppeteer-only — no fetch tier). Each call launches its own browser. Exports `CarListing` class.
+- `src/cargurusReference.js` — resolves make/model names to CarGurus's internal `makeId`/`modelId` codes via `resolveMakeModel(page, make, model)`. Takes a caller-supplied already-open Puppeteer `page` since the reference endpoints are DataDome-blocked to plain fetch same as the rest of cargurus.com. Non-throwing on a miss; per-process caches for makes and per-makeId models.
+- `test/` — `node:test` suite, runs offline, ~230ms. See "Tests" below.
 - `mcp.json` / `server.json` — MCP marketplace metadata.
 - HAR files (cookies stripped):
   - `/Users/rkodali/Downloads/www.autotrader.com.har` (63 MB)
@@ -366,10 +416,11 @@ Cars.com 403 is a normal status check.
   - `/Users/rkodali/Downloads/www.carvana.com.har`, `/Users/rkodali/Downloads/22_may_2026www.carvana.com.har`
   - `/Users/rkodali/Downloads/www.thezebra.com.har` (615 KB)
   - `/Users/rkodali/Downloads/www.taxjar.com.har` (12 MB)
+  - `/Users/rkodali/Downloads/www.cargurus.com_Archive [26-09-04 06-15-16].har`
 
 ## Tests
 
-`npm run test:unit` runs the full `node:test` suite (`node --test test/*.test.js`). 125 tests, fully offline, ~230ms. Files:
+`npm run test:unit` runs the full `node:test` suite (`node --test test/*.test.js`). 177 tests, fully offline, ~230ms. Files:
 
 - `test/loanCalculator.test.js` — pure math, edge cases, `totalCostBreakdown` (tax-financed-into-principal, EV surcharge gating, default down-payment ratio).
 - `test/insuranceClient.test.js` — Zebra request body shape, HTML rate parsing, median for odd/even counts, fallback to top-level `rate`, error paths.
@@ -377,7 +428,8 @@ Cars.com 403 is a normal status check.
 - `test/feeData.test.js` — every state present in both tables, values are non-negative integers, case-insensitive lookups.
 - `test/apiClient.test.js` — `fetchAutotrader` (URL/QS construction, `vhrPreview`, post-filter, model-code prefixing, body/fuel mapping, dealRating mapping, AkamaiBlockError), `fetchKbb` (Cox shape variations, channel=KBB, KBB-specific URL host, dealType post-filter), `fetchCarscom` (filter construction, `analytics.context`, auth-failure retry, body/fuel slugs, **radius post-filter drops out-of-range seller ZIPs, fail-open on unresolvable / missing ZIPs**), `fetchCarmax` (uri slug construction, make/model/body/fuel segments, maxResults, error paths), `fetchCarvana` (request body filters, make+parentModels shape, dealRating from vehicleTags, error paths).
 - `test/zipDistance.test.js` — `haversineMiles` correctness, `getZipCoords` parsing/caching/404/input validation, `distanceMiles` short-circuit + fail-open behavior.
-- `test/server.test.js` — orchestration: fetch success, 0-listings → Puppeteer fallback, fetch throws → fallback, both fail → `{error}` envelope, KBB fetch path. Stubs `apiClient`/`scraper`/`insuranceClient`/`loanCalculator`/`feeClient`/`feeData` via `require.cache` priming **before** loading `server.js` (the destructured imports at the top of server.js capture function references at load time — mutating the fake exports after the require has no effect).
+- `test/cargurusReference.test.js` — `resolveMakeModel` against a fake Puppeteer `page` (a stub exposing just `.goto()`/`.evaluate()`, since this module has no fetch path to mock `global.fetch` against): make+model hit, case/spacing insensitivity, make-miss short-circuiting the model lookup, model-miss within a known make, null inputs, malformed-JSON handling, and makes-index caching across calls.
+- `test/server.test.js` — orchestration: fetch success, 0-listings → Puppeteer fallback, fetch throws → fallback, both fail → `{error}` envelope, KBB and CarGurus fetch/scrape paths. Stubs `apiClient`/`scraper`/`insuranceClient`/`loanCalculator`/`feeClient`/`feeData` via `require.cache` priming **before** loading `server.js` (the destructured imports at the top of server.js capture function references at load time — mutating the fake exports after the require has no effect).
 
 `npm test` is still the live Puppeteer Cars.com smoke. Don't run it in CI.
 
@@ -401,4 +453,7 @@ Cars.com 403 is a normal status check.
 8. **State EV surcharge + registration tables are static and rot.** Refresh annually or when state legislation changes. The file headers in `src/feeData.js` carry a "last verified" date and source URLs.
 9. **Registration estimates are coarse.** CA's 0.65% Vehicle License Fee + first-year-vs-renewal split, weight-based fees in WA/MN/etc., aren't modeled. The output labels these as estimates.
 10. **`npm audit` is clean; keep it that way.** As of 2026-07-08 the tree has **0 vulnerabilities**. CI's gate is `npm audit --omit=dev --audit-level=high` — it fails only on HIGH/CRITICAL findings in the *runtime* tree, so moderate/dev-only advisories surface via the weekly Dependabot run rather than blocking PRs. History worth knowing: this gate broke once when transitive `ws` (via `puppeteer-core`) and `hono` (via `@modelcontextprotocol/sdk`) picked up HIGH DoS advisories; a plain `npm audit fix` cleared all findings with patch/minor transitive bumps only (no `--force`, no majors). If the gate fails again, try `npm audit fix` first and re-run `npm run test:unit` — only reach for a documented exception if a fix would require a breaking major bump.
-11. **Dependabot cooldown = 7 days.** `.github/dependabot.yml` sets `cooldown: default-days: 7` on both the npm and github-actions ecosystems, so freshly-published versions soak for a week before Dependabot proposes them (day-zero supply-chain hardening). The value is also what semgrep's `dependabot-missing-cooldown` rule requires — it wants `>=7`, so don't lower it or the Semgrep job goes red. Practical effect: grouped update PRs land ~a week later than a package's release.
+11. **CarGurus's `vehicleHistoryOptions` filter is unverified and not wired in.** The real `/search` URL accepts `vehicleHistoryOptions=CLEAN_TITLE,SINGLE_OWNER,NON_FLEET`, but `CLEAN_TITLE`'s rendered UI label ("No accidents reported") doesn't match its token name, and the SRP tile has no per-listing field to confirm the filter actually narrows results server-side. Needs a live before/after listing-count probe (same technique used to verify Cars.com's `one_owner`/`no_accidents` filters) before it's trustworthy enough to wire up.
+12. **CarGurus's location section hydrates asynchronously and sometimes loses the race.** `scrapeCarGurus` waits (bounded, fail-open) for the first tile's `LocationSection-firstLine` before scraping, but live testing (2026-09-04) showed other tiles on the same page can still come back with `location: null` depending on timing — looks like per-tile lazy hydration rather than a single page-load event. A `page.waitForFunction` that checks *every* visible tile (or scrolls each into view) would likely close this further, at the cost of scrape latency. Not done — the rest of each listing (title/price/dealRating/URL) is unaffected, so this degrades gracefully.
+13. **CarGurus scraping has no pagination.** `scrapeCarGurus` only ever sees the first SRP page (~20-24 tiles) — there's no "load more"/page-param support built. Fine for a sixth source alongside five others, but means CarGurus results are capped low relative to the fetch-based sources.
+14. **Dependabot cooldown = 7 days.** `.github/dependabot.yml` sets `cooldown: default-days: 7` on both the npm and github-actions ecosystems, so freshly-published versions soak for a week before Dependabot proposes them (day-zero supply-chain hardening). The value is also what semgrep's `dependabot-missing-cooldown` rule requires — it wants `>=7`, so don't lower it or the Semgrep job goes red. Practical effect: grouped update PRs land ~a week later than a package's release.

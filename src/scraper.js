@@ -6,6 +6,19 @@ puppeteer.use(StealthPlugin());
 // transitively import puppeteer/stealth just to construct a listing object.
 // Re-exported below for any callers that still `require('./scraper.js').CarListing`.
 const { CarListing } = require('./carListing.js');
+const cargurusReference = require('./cargurusReference.js');
+// Pulled from apiClient.js so CarGurus shares the same fuel/drivetrain
+// vocabulary as every other source instead of duplicating the mapping.
+// apiClient.js itself has no puppeteer dependency, so this doesn't pull
+// puppeteer in anywhere it wasn't already.
+const { normalizeFuelType, normalizeDriveType } = require('./apiClient.js');
+const { parsePrice } = require('./loanCalculator.js');
+
+function parseMileageStr(s) {
+    if (!s) return null;
+    const digits = String(s).replace(/[^\d]/g, '');
+    return digits ? Number(digits) : null;
+}
 
 /**
  * Launch browser with stealth settings.
@@ -379,6 +392,187 @@ async function scrapeKBB(params, maxResults = 20) {
 }
 
 /**
+ * Scrape CarGurus for car listings.
+ *
+ * Puppeteer-only — there is no fetch tier for this source, unlike
+ * Cars.com/Autotrader/KBB above (fetch-first, Puppeteer-on-error). CarGurus
+ * runs DataDome bot protection: plain Node `fetch` gets HTTP 406 on every
+ * endpoint tested, even with headers copied verbatim from a real captured
+ * browser session (verified 2026-09-04 against a live HAR). Puppeteer +
+ * stealth gets through cleanly. Architecturally this is single-tier like
+ * Carvana (API-only) — just Puppeteer instead of fetch.
+ *
+ * The upside of needing Puppeteer: CarGurus's search-results page is a
+ * cookie-less, auth-free Remix-SSR page that embeds real listing data
+ * directly as structured markup — each card
+ * (`[data-testid="srp-listing-tile"]`) contains a `<dl>` of dt/dd pairs
+ * (Year, Make, Model, Drivetrain, Fuel type, Mileage, VIN, ...). That's
+ * real per-listing data, not free text we have to regex apart like the
+ * Cars.com/Autotrader/KBB scrapers above.
+ *
+ * Known limitations (documented rather than silently wrong):
+ *   - No per-listing CARFAX-equivalent field on the SRP tile (no
+ *     owner-history/accident data), so isOneOwner/noAccidents/personalUse
+ *     stay false — same posture as Carvana. See SOURCE_CAPABILITIES in
+ *     server.js.
+ *   - Single SRP page only (~20-24 tiles); no pagination. Fine for a
+ *     comparison source, same posture as CarMax's HTML fallback.
+ *   - Dealer name is only present on sponsored tiles (a dealer logo image
+ *     with the dealer's name as `alt`); non-sponsored tiles don't expose
+ *     dealer name on the SRP at all.
+ *   - When a listing is nationwide-shippable, CarGurus's location line
+ *     shows "Price includes $X shipping" instead of a distance. We surface
+ *     that as-is in `location` — it's the real per-listing figure.
+ *   - make/model, priceMax, and mileageMax are enforced (make/model via
+ *     resolveMakeModel + a post-filter on the tile's own Make/Model fields;
+ *     price/mileage via a post-filter on the tile's price/mileage text,
+ *     since the CarGurus search URL's real query-param names for those
+ *     aren't verified). `condition`, `bodyStyle`, `fuelType`, `dealRating`,
+ *     and `keyword` are NOT wired through at all for this source yet — same
+ *     "documented gap" posture as e.g. dealRating=fair on Autotrader/KBB.
+ */
+async function scrapeCarGurus(params, maxResults = 20) {
+    const listings = [];
+    let browser;
+
+    try {
+        browser = await launchBrowser();
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1920, height: 1080 });
+
+        const { makeId, modelId } = await cargurusReference.resolveMakeModel(page, params.make, params.model);
+
+        const qs = new URLSearchParams();
+        if (makeId && modelId) qs.set('makeModelTrimPaths', `${makeId}/${modelId}`);
+        else if (makeId) qs.set('makeModelTrimPaths', makeId);
+        qs.set('zip', params.zip || '90210');
+        qs.set('distance', String(params.searchRadius || 50));
+        qs.set('sortType', 'PRICE');
+        qs.set('sortDirection', 'ASC');
+        if (params.yearMin) qs.set('startYear', String(params.yearMin));
+        if (params.yearMax) qs.set('endYear', String(params.yearMax));
+
+        const url = `https://www.cargurus.com/search?${qs.toString()}`;
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        // The location section (city/distance or shipping-fee text) hydrates
+        // asynchronously after the tiles themselves paint — a flat sleep here
+        // races it and intermittently ships `location: null` on every tile
+        // (verified live 2026-09-04: ~50% of runs). Wait for the first tile's
+        // location section to actually populate; on timeout proceed anyway
+        // rather than fail the whole scrape (fail-open, same posture as the
+        // ZIP-distance lookups elsewhere in this codebase).
+        try {
+            await page.waitForFunction(() => {
+                const tiles = document.querySelectorAll('[data-testid="srp-listing-tile"]');
+                return tiles.length > 0 && !!tiles[0].querySelector('[data-testid="LocationSection-firstLine"]');
+            }, { timeout: 8000 });
+        } catch {
+            // Hydration didn't finish in time — some tiles may still render
+            // with a null location. Non-fatal.
+        }
+
+        const rawListings = await page.evaluate(() => {
+            const results = [];
+            const tiles = document.querySelectorAll('[data-testid="srp-listing-tile"]');
+
+            tiles.forEach(tile => {
+                const link = tile.querySelector('a[data-testid="tile-link"]');
+                if (!link) return;
+
+                const props = {};
+                link.querySelectorAll('dl > dt').forEach(dt => {
+                    const key = dt.textContent.replace(':', '').trim();
+                    const dd = dt.nextElementSibling;
+                    if (dd) props[key] = dd.textContent.trim();
+                });
+
+                const trimEl = tile.querySelector('[data-cg-ft="vehicle"]');
+                const priceEl = tile.querySelector('[data-testid="srp-tile-price"]');
+                const dealRatingEl = tile.querySelector('[data-testid="srp-tile-deal-rating"]');
+                const locFirst = tile.querySelector('[data-testid="LocationSection-firstLine"]');
+                const locSecond = tile.querySelector('[data-testid="LocationSection-secondLine"]');
+                const dealerLogo = tile.querySelector('img[class*="_dealerLogoSized"]');
+
+                results.push({
+                    year: props['Year'] || null,
+                    make: props['Make'] || null,
+                    model: props['Model'] || null,
+                    trim: trimEl ? (trimEl.getAttribute('title') || trimEl.textContent.trim()) : null,
+                    driveTrain: props['Drivetrain'] || null,
+                    fuelType: props['Fuel type'] || null,
+                    mileage: props['Mileage'] || null,
+                    price: priceEl ? priceEl.textContent.trim() : null,
+                    dealRating: dealRatingEl ? dealRatingEl.textContent.trim() : null,
+                    locationCity: locFirst ? locFirst.textContent.trim() : null,
+                    locationDetail: locSecond ? locSecond.textContent.trim() : null,
+                    dealerName: dealerLogo ? dealerLogo.getAttribute('alt') : null,
+                    href: link.getAttribute('href')
+                });
+            });
+
+            return results;
+        });
+
+        // resolveMakeModel silently broadens the query on a lookup miss —
+        // e.g. an unresolved model falls back to a make-only search, and an
+        // unresolved make falls back to no makeModelTrimPaths at all (see
+        // its own header comment). Post-filter on the tile's own Make/Model
+        // fields (real per-listing data, not inferred) so a caller-specified
+        // make/model that CarGurus's ID index doesn't recognize can't return
+        // unrelated vehicles. Same normalize() used to build that index, so
+        // spacing/hyphen/case variants (e.g. "Ioniq 5" vs "Ioniq5") still match.
+        const wantMake = params.make ? cargurusReference.normalize(params.make) : null;
+        const wantModel = params.model ? cargurusReference.normalize(params.model) : null;
+        const filtered = rawListings.filter(item => {
+            if (wantMake && cargurusReference.normalize(item.make) !== wantMake) return false;
+            if (wantModel && cargurusReference.normalize(item.model) !== wantModel) return false;
+            // priceMax/mileageMax aren't wired into the CarGurus search URL
+            // (unverified param names) — post-filter on the tile's own
+            // price/mileage text instead of returning them unfiltered.
+            if (params.priceMax) {
+                const price = parsePrice(item.price);
+                if (price != null && price > params.priceMax) return false;
+            }
+            if (params.mileageMax) {
+                const mileage = parseMileageStr(item.mileage);
+                if (mileage != null && mileage > params.mileageMax) return false;
+            }
+            return true;
+        });
+
+        for (const item of filtered.slice(0, maxResults)) {
+            const title = [item.year, item.make, item.model, item.trim].filter(Boolean).join(' ') || null;
+            const location = [item.locationCity, item.locationDetail].filter(Boolean).join(' — ') || null;
+            listings.push(new CarListing({
+                title,
+                price: item.price,
+                mileage: item.mileage,
+                dealerName: item.dealerName,
+                location,
+                dealRating: item.dealRating,
+                // Drop the tracking query string (resultSetId/searchUuid/srpc/...)
+                // — the bare /details/{id} path is the canonical VDP URL, same
+                // convention as Autotrader's reconstructed listingId URL.
+                url: item.href ? `https://www.cargurus.com${item.href.split('?')[0]}` : null,
+                source: 'CarGurus',
+                isOneOwner: false,
+                noAccidents: false,
+                personalUse: false,
+                fuelType: normalizeFuelType(item.fuelType),
+                driveType: normalizeDriveType(item.driveTrain)
+            }));
+        }
+
+        await browser.close();
+    } catch (err) {
+        if (browser) await browser.close();
+        throw new Error(`CarGurus scraping failed: ${err.message}`);
+    }
+
+    return listings;
+}
+
+/**
  * Search all sources and combine results
  */
 async function searchAllSources(params, maxResultsPerSource = 10) {
@@ -420,5 +614,6 @@ module.exports = {
     scrapeCarscom,
     scrapeAutotrader,
     scrapeKBB,
+    scrapeCarGurus,
     searchAllSources
 };

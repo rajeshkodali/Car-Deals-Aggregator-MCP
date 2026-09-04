@@ -16,8 +16,8 @@ description: Format car-listing search results for the user. Use whenever you re
 2. **One URL per car.** If the same listing appears on multiple sources, pick
    exactly one using this precedence: **Cars.com > Autotrader > KBB**. Never
    emit two rows for the same car and never show two links for one car.
-   (Cars.com, CarMax, and Carvana have independent inventory and aren't deduped
-   against each other — only Autotrader ↔ KBB collapse.)
+   (Cars.com, CarMax, Carvana, and CarGurus have independent inventory and
+   aren't deduped against each other — only Autotrader ↔ KBB collapse.)
 
 3. **Sanity check before you send.** Imagine the output in a plain monospace
    terminal with no hyperlink rendering. If the user would see only the word
@@ -35,5 +35,5 @@ description: Format car-listing search results for the user. Use whenever you re
 
 ## Default search behavior (when the user hasn't narrowed it)
 
-Include all 5 sources (`cars.com`, `autotrader`, `kbb`, `carmax`, `carvana`) and
-`maxResults >= 50` unless the user says otherwise.
+Include all 6 sources (`cars.com`, `autotrader`, `kbb`, `carmax`, `carvana`,
+`cargurus`) and `maxResults >= 50` unless the user says otherwise.
