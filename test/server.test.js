@@ -57,6 +57,7 @@ function loadServerWithStubs({ api = {}, scraper = {}, insurance, loan, fees } =
         scrapeCarscom: scraper.scrapeCarscom || (async () => { throw new Error('scrapeCarscom not stubbed'); }),
         scrapeAutotrader: scraper.scrapeAutotrader || (async () => { throw new Error('scrapeAutotrader not stubbed'); }),
         scrapeKBB: scraper.scrapeKBB || (async () => { throw new Error('scrapeKBB not stubbed'); }),
+        scrapeCarGurus: scraper.scrapeCarGurus || (async () => { throw new Error('scrapeCarGurus not stubbed'); }),
         CarListing: class { constructor(o) { Object.assign(this, o); } }
     };
     // Insurance stub: by default, no estimate. Test can opt in.
@@ -258,6 +259,38 @@ test('searchKBB swallows scraper errors and returns error envelope', async () =>
         const out = await server.searchKBB({ zip: '90210' }, 5);
         assert.deepEqual(out.listings, []);
         assert.equal(out.error, 'kbb down');
+    } finally { restoreLogs(); }
+});
+
+// ---------- searchCarGurus (Puppeteer-only, no fetch path) ----------
+
+test('searchCarGurus delegates to scrapeCarGurus and returns its listings', async () => {
+    let captured = null;
+    const { server, restoreLogs } = loadServerWithStubs({
+        scraper: {
+            scrapeCarGurus: async (params, max) => {
+                captured = { params, max };
+                return [makeListing({ source: 'CarGurus' })];
+            }
+        }
+    });
+    try {
+        const out = await server.searchCarGurus({ zip: '90210', make: 'Hyundai' }, 7);
+        assert.equal(out.source, 'CarGurus');
+        assert.equal(out.listings.length, 1);
+        assert.equal(captured.max, 7);
+        assert.equal(captured.params.make, 'Hyundai');
+    } finally { restoreLogs(); }
+});
+
+test('searchCarGurus swallows scraper errors and returns an empty envelope', async () => {
+    const { server, restoreLogs } = loadServerWithStubs({
+        scraper: { scrapeCarGurus: async () => { throw new Error('cargurus down'); } }
+    });
+    try {
+        const out = await server.searchCarGurus({ zip: '90210' }, 5);
+        assert.equal(out.source, 'CarGurus');
+        assert.deepEqual(out.listings, []);
     } finally { restoreLogs(); }
 });
 
@@ -514,7 +547,7 @@ test('handleSearchCarDeals surfaces unknown sources in the rendered output', asy
         const out = await server.handleSearchCarDeals({ zip: '90210', sources: ['cars.com', 'craigslist', 'facebook'] });
         const text = out.content[0].text;
         assert.match(text, /Unknown sources ignored:\*\* craigslist, facebook/);
-        assert.match(text, /Known sources: cars\.com, autotrader, kbb, carmax, carvana/);
+        assert.match(text, /Known sources: cars\.com, autotrader, kbb, carmax, carvana, cargurus/);
     } finally { restoreLogs(); }
 });
 
@@ -534,6 +567,23 @@ test('handleSearchCarDeals skips Carvana when oneOwner is requested (capability 
         assert.equal(carvanaCalls, 0, 'Carvana not called when oneOwner is required');
         assert.match(text, /Sources skipped due to filter requirements/);
         assert.match(text, /carvana: oneOwner=true not enforceable/);
+    } finally { restoreLogs(); }
+});
+
+test('handleSearchCarDeals skips CarGurus when oneOwner is requested (capability gap)', async () => {
+    let cargurusCalls = 0;
+    const { server, restoreLogs } = loadServerWithStubs({
+        api: { fetchAutotrader: async () => [] },
+        scraper: { scrapeCarGurus: async () => { cargurusCalls += 1; return []; } }
+    });
+    try {
+        const out = await server.handleSearchCarDeals({
+            zip: '90210', sources: ['autotrader', 'cargurus'], oneOwner: true
+        });
+        const text = out.content[0].text;
+        assert.equal(cargurusCalls, 0, 'CarGurus not called when oneOwner is required');
+        assert.match(text, /Sources skipped due to filter requirements/);
+        assert.match(text, /cargurus: oneOwner=true not enforceable/);
     } finally { restoreLogs(); }
 });
 

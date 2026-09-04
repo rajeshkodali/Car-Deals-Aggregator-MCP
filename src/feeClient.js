@@ -1,15 +1,18 @@
 'use strict';
 
-// ZIP-level sales tax lookup via TaxJar's public widget calculator endpoint:
-//   GET https://taxjar.netlify.app/.netlify/functions/calculator?zip={zip}&country=US
+// ZIP-level sales tax lookup. Two-tier strategy, same shape as the fetch-then-
+// Puppeteer fallback used elsewhere in this project:
 //
-// This is the same endpoint TaxJar's marketing-page calculator uses. No auth,
-// no API key — it's a serverless function fronting their published rate data.
-// Posture is the same as cars.com / autotrader: undocumented public endpoint,
-// could change shape any time, callers must handle failure gracefully.
+// 1. zip-tax.com (`fetchZipTax`) — keyed, documented, licensed-for-commercial-
+//    -use REST API (https://docs.zip.tax/guides/rest-api/by-postal-code).
+//    Requires ZIP_TAX_API_KEY in the environment. Tried first when the key is
+//    present.
+// 2. TaxJar's public widget calculator (`fetchTaxJar`) — no auth, no API key,
+//    undocumented serverless function fronting TaxJar's published rate data.
+//    Used when ZIP_TAX_API_KEY is unset, or when the zip.tax call throws.
 //
-// Returns combined city + county + state + district rate for the ZIP. Caveat:
-// returns the *general retail* sales tax rate. A handful of states (e.g. NC,
+// Both return the same normalized shape. Caveat that applies to both sources:
+// this is the *general retail* sales tax rate. A handful of states (e.g. NC,
 // AL) tax vehicle purchases at a different rate than retail; we don't model
 // that override — disclaim it in the rendered output instead.
 
@@ -19,12 +22,54 @@ const { fetchWithTimeout } = require('./httpClient.js');
 
 const cache = new Map(); // zip -> result
 
-async function lookupSalesTax(zip) {
-    if (!zip) throw new Error('zip is required');
-    const key = String(zip);
-    if (cache.has(key)) return cache.get(key);
+// zip-tax.com can return multiple results for a single ZIP (ZIPs that span
+// more than one city/tax jurisdiction, e.g. 98033 -> Kirkland + Redmond).
+// We take the first result, matching the single-jurisdiction assumption the
+// rest of this module (and TaxJar) already makes.
+async function fetchZipTax(zip, apiKey) {
+    const url = `https://api.zip-tax.com/request/v60?${new URLSearchParams({ postalcode: zip })}`;
+    const res = await fetchWithTimeout(url, {
+        headers: { 'X-API-KEY': apiKey },
+        // zip.tax is called with a credential header; refuse to follow a redirect
+        // rather than replay X-API-KEY to whatever host it points to (Undici only
+        // strips Authorization on cross-origin redirects, not custom headers).
+        redirect: 'error'
+    }, { timeoutMs: 8_000, label: 'zip.tax' });
+    if (res.status !== 200) throw new Error(`zip.tax HTTP ${res.status}`);
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { throw new Error('zip.tax returned non-JSON'); }
+    if (data.rCode !== 100) throw new Error(`zip.tax rCode ${data.rCode}: ${JSON.stringify(data).slice(0, 150)}`);
 
-    const url = `https://taxjar.netlify.app/.netlify/functions/calculator?street=&city=&zip=${encodeURIComponent(key)}&country=US`;
+    const r = Array.isArray(data.results) ? data.results[0] : null;
+    if (!r) throw new Error('zip.tax response missing results');
+
+    // Number(null|false|'') is 0, which is finite — that would silently coerce a
+    // malformed response into a real (zero) rate instead of falling back to
+    // TaxJar. Only accept an actual number or a non-blank string before coercing.
+    const rawTaxSales = r.taxSales;
+    const looksNumeric = typeof rawTaxSales === 'number'
+        || (typeof rawTaxSales === 'string' && rawTaxSales.trim() !== '');
+    if (!looksNumeric) throw new Error('zip.tax taxSales not numeric');
+    const combined = Number(rawTaxSales);
+    if (!Number.isFinite(combined)) throw new Error('zip.tax taxSales not numeric');
+
+    return {
+        zip: String(zip),
+        state: r.geoState || null,
+        city: r.geoCity || null,
+        county: r.geoCounty || null,
+        combinedRate: combined,
+        stateRate: Number(r.rateState) || 0,
+        countyRate: Number(r.rateCounty) || 0,
+        cityRate: Number(r.rateCity) || 0,
+        districtRate: Number(r.rateAdditional) || 0,
+        source: 'zip-tax.com'
+    };
+}
+
+async function fetchTaxJar(zip) {
+    const url = `https://taxjar.netlify.app/.netlify/functions/calculator?street=&city=&zip=${encodeURIComponent(zip)}&country=US`;
     const res = await fetchWithTimeout(url, {
         headers: {
             'accept': 'application/json, text/javascript, */*; q=0.01',
@@ -45,8 +90,8 @@ async function lookupSalesTax(zip) {
     const combined = Number(r.combined_rate);
     if (!Number.isFinite(combined)) throw new Error('TaxJar combined_rate not numeric');
 
-    const out = {
-        zip: key,
+    return {
+        zip: String(zip),
         state: r.state || null,
         city: r.city || null,
         county: r.county || null,
@@ -57,6 +102,27 @@ async function lookupSalesTax(zip) {
         districtRate: Number(r.combined_district_rate) || 0,
         source: 'taxjar.com calculator widget'
     };
+}
+
+async function lookupSalesTax(zip) {
+    if (!zip) throw new Error('zip is required');
+    const key = String(zip);
+    if (cache.has(key)) return cache.get(key);
+
+    const apiKey = process.env.ZIP_TAX_API_KEY;
+    let out = null;
+    if (apiKey) {
+        try {
+            out = await fetchZipTax(key, apiKey);
+        } catch (err) {
+            // Logged server-side only (stdio MCP process, no HTTP response path) —
+            // never returned to a caller. Passed as a separate arg, not templated
+            // into the message string, per njsscan's generic_error_disclosure rule.
+            console.error('[feeClient] zip.tax lookup failed, falling back to TaxJar:', err.message);
+        }
+    }
+    if (!out) out = await fetchTaxJar(key);
+
     cache.set(key, out);
     return out;
 }

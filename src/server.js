@@ -14,7 +14,7 @@ const {
     ListToolsRequestSchema,
 } = require('@modelcontextprotocol/sdk/types.js');
 
-const { scrapeCarscom, scrapeAutotrader, scrapeKBB } = require('./scraper.js');
+const { scrapeCarscom, scrapeAutotrader, scrapeKBB, scrapeCarGurus } = require('./scraper.js');
 const { fetchAutotrader, fetchCarscom, fetchKbb, fetchCarmax, fetchCarmaxFromHtml, fetchCarvana } = require('./apiClient.js');
 const { estimateInsurance } = require('./insuranceClient.js');
 const { monthlyPayment, parsePrice, totalCostBreakdown } = require('./loanCalculator.js');
@@ -72,7 +72,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         sources: {
                             type: 'array',
                             items: { type: 'string' },
-                            description: 'Optional. Sources to query: "cars.com", "autotrader", "kbb", "carmax", "carvana". Default: cars.com + autotrader.',
+                            description: 'Optional. Sources to query: "cars.com", "autotrader", "kbb", "carmax", "carvana", "cargurus". Default: cars.com + autotrader.',
                         },
                         bodyStyle: {
                             type: 'string',
@@ -194,6 +194,20 @@ async function searchCarvana(params, maxResults) {
     return { source: 'Carvana', listings: [] };
 }
 
+// CarGurus has no fetch tier at all (see scrapeCarGurus's header comment in
+// scraper.js) — it's Puppeteer-only, single-tier like Carvana's fetch-only
+// shape, just on the opposite side of the fetch/Puppeteer split.
+async function searchCarGurus(params, maxResults) {
+    try {
+        const listings = await scrapeCarGurus(params, maxResults);
+        console.error(`[MCP] CarGurus scrape: ${listings.length} listings`);
+        return { source: 'CarGurus', listings };
+    } catch (err) {
+        console.error('[MCP] CarGurus scrape failed:', err.message);
+    }
+    return { source: 'CarGurus', listings: [] };
+}
+
 // Exported for direct test invocation — wraps the same logic the MCP
 // CallTool handler does, minus the `name`/`arguments` envelope. Returns
 // the same { content: [...] } / { content, isError } shape.
@@ -221,7 +235,7 @@ async function handleSearchCarDeals(args = {}) {
         const rawSources = (args.sources && args.sources.length) ? args.sources : ['cars.com', 'autotrader'];
         // Validate sources up front; surface unknowns rather than silently
         // dropping them. Comparison is case-insensitive on the canonical key.
-        const KNOWN_SOURCES = new Set(['cars.com', 'autotrader', 'kbb', 'carmax', 'carvana']);
+        const KNOWN_SOURCES = new Set(['cars.com', 'autotrader', 'kbb', 'carmax', 'carvana', 'cargurus']);
         const normalizedSources = [];
         const unknownSources = [];
         for (const s of rawSources) {
@@ -252,7 +266,16 @@ async function handleSearchCarDeals(args = {}) {
             'autotrader': { oneOwner: true,  noAccidents: true,  personalUse: true  },
             'kbb':        { oneOwner: true,  noAccidents: true,  personalUse: true  },
             'carmax':     { oneOwner: true,  noAccidents: false, personalUse: false },
-            'carvana':    { oneOwner: false, noAccidents: false, personalUse: false }
+            'carvana':    { oneOwner: false, noAccidents: false, personalUse: false },
+            // CarGurus's SRP tile carries no per-listing CARFAX-equivalent field
+            // (no owner-history/accident data in its <dl>), even though the
+            // real site's /search URL accepts a vehicleHistoryOptions param
+            // (CLEAN_TITLE/SINGLE_OWNER/NON_FLEET, seen in a live HAR capture)
+            // — we haven't verified that param actually filters server-side,
+            // and even if it does we'd have no per-listing field to back the
+            // badge with. Same conservative posture as Carvana until that's
+            // verified live.
+            'cargurus':   { oneOwner: false, noAccidents: false, personalUse: false }
         };
         // For each requested CARFAX filter, find sources that can't honour
         // it and record a skip reason. We exclude those sources from the
@@ -305,6 +328,7 @@ async function handleSearchCarDeals(args = {}) {
         if (eligibleSources.includes('kbb')) tasks.push(searchKBB(params, maxResults));
         if (eligibleSources.includes('carmax')) tasks.push(searchCarmax(params, maxResults));
         if (eligibleSources.includes('carvana')) tasks.push(searchCarvana(params, maxResults));
+        if (eligibleSources.includes('cargurus')) tasks.push(searchCarGurus(params, maxResults));
 
         const insurancePromise = includeEstimates
             ? estimateInsurance(insuranceOpts).catch(err => {
@@ -408,7 +432,7 @@ async function handleSearchCarDeals(args = {}) {
         }
         if (unknownSources.length) {
             output += `**Unknown sources ignored:** ${unknownSources.join(', ')}. `;
-            output += `_Known sources: cars.com, autotrader, kbb, carmax, carvana._\n\n`;
+            output += `_Known sources: cars.com, autotrader, kbb, carmax, carvana, cargurus._\n\n`;
         }
 
         if (insurance) {
@@ -502,6 +526,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-    searchCarscom, searchAutotrader, searchKBB, searchCarmax, searchCarvana,
+    searchCarscom, searchAutotrader, searchKBB, searchCarmax, searchCarvana, searchCarGurus,
     handleSearchCarDeals
 };
