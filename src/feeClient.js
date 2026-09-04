@@ -115,7 +115,10 @@ async function lookupSalesTax(zip) {
         try {
             out = await fetchZipTax(key, apiKey);
         } catch (err) {
-            console.error(`[feeClient] zip.tax lookup failed (${err.message}), falling back to TaxJar`);
+            // Logged server-side only (stdio MCP process, no HTTP response path) —
+            // never returned to a caller. Passed as a separate arg, not templated
+            // into the message string, per njsscan's generic_error_disclosure rule.
+            console.error('[feeClient] zip.tax lookup failed, falling back to TaxJar:', err.message);
         }
     }
     if (!out) out = await fetchTaxJar(key);
