@@ -203,7 +203,7 @@ async function searchCarGurus(params, maxResults) {
         console.error(`[MCP] CarGurus scrape: ${listings.length} listings`);
         return { source: 'CarGurus', listings };
     } catch (err) {
-        console.error(`[MCP] CarGurus scrape failed (${err.message})`);
+        console.error('[MCP] CarGurus scrape failed:', err.message);
     }
     return { source: 'CarGurus', listings: [] };
 }

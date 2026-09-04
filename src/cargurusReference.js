@@ -65,7 +65,7 @@ async function resolveMakeModel(page, make, model) {
             const makes = await getMakesIndex(page);
             makeId = makes.get(normalize(make)) || null;
         } catch (err) {
-            console.error(`[cargurusReference] listMakes lookup failed: ${err.message}`);
+            console.error('[cargurusReference] listMakes lookup failed:', err.message);
         }
     }
     if (makeId && model) {
@@ -73,7 +73,7 @@ async function resolveMakeModel(page, make, model) {
             const models = await getModelsIndex(page, makeId);
             modelId = models.get(normalize(model)) || null;
         } catch (err) {
-            console.error(`[cargurusReference] listModels lookup failed: ${err.message}`);
+            console.error('[cargurusReference] listModels lookup failed:', err.message);
         }
     }
     return { makeId, modelId };
