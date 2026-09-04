@@ -341,6 +341,57 @@ test('fetchKbb honours dealRating=great via dealType + post-filter', async () =>
     assert.equal(qs.get('dealType'), 'greatprice');
 });
 
+test('fetchAutotrader maps electricComponentInfo.batteryDegradationInfo to batteryHealthRating/Label', async () => {
+    const { fetchAutotrader } = loadFreshApiClient();
+    const body = { listings: [
+        {
+            id: 'EV1',
+            fuelType: { code: 'ELE' },
+            electricComponentInfo: {
+                batteryDegradationInfo: { healthRating: 92, healthDescription: 'GREAT' }
+            },
+            vhrPreview: []
+        }
+    ] };
+    let out;
+    await withFetchStub(async () => makeFetchResponse({ body }), async () => {
+        out = await fetchAutotrader({ zip: '90210', fuelType: 'ev' }, 5);
+    });
+    assert.equal(out[0].batteryHealthRating, 92);
+    assert.equal(out[0].batteryHealthLabel, 'GREAT');
+});
+
+test('fetchKbb also maps batteryDegradationInfo (shared Cox mapper)', async () => {
+    const { fetchKbb } = loadFreshApiClient();
+    const body = { listings: [
+        {
+            id: 'EV2',
+            fuelType: { code: 'ELE' },
+            electricComponentInfo: {
+                batteryDegradationInfo: { healthRating: 78, healthDescription: 'GOOD' }
+            },
+            vhrPreview: []
+        }
+    ] };
+    let out;
+    await withFetchStub(async () => makeFetchResponse({ body }), async () => {
+        out = await fetchKbb({ zip: '90210', fuelType: 'ev' }, 5);
+    });
+    assert.equal(out[0].batteryHealthRating, 78);
+    assert.equal(out[0].batteryHealthLabel, 'GOOD');
+});
+
+test('fetchAutotrader leaves batteryHealthRating/Label null when absent (gas listing)', async () => {
+    const { fetchAutotrader } = loadFreshApiClient();
+    const body = { listings: [{ id: 'G1', fuelType: { code: 'GSL' }, vhrPreview: [] }] };
+    let out;
+    await withFetchStub(async () => makeFetchResponse({ body }), async () => {
+        out = await fetchAutotrader({ zip: '90210' }, 5);
+    });
+    assert.equal(out[0].batteryHealthRating, null);
+    assert.equal(out[0].batteryHealthLabel, null);
+});
+
 test('fetchAutotrader silently drops unknown bodyStyle/fuelType values', async () => {
     const { fetchAutotrader } = loadFreshApiClient();
     let captured = null;
@@ -781,7 +832,8 @@ test('fetchCarmax builds the expected URL/params and parses items', async () => 
             mileage: 20539,
             storeName: 'Renton', storeCity: 'Renton', stateAbbreviation: 'WA',
             highlights: ['singleOwner', 'lowMiles'],
-            fuelType: null, engineType: 'Gas'
+            fuelType: null, engineType: 'Gas',
+            driveTrain: 'All Wheel Drive'
         }]
     };
 
@@ -805,6 +857,7 @@ test('fetchCarmax builds the expected URL/params and parses items', async () => 
         assert.equal(out[0].url, 'https://www.carmax.com/car/28510937');
         assert.equal(out[0].isOneOwner, true);
         assert.equal(out[0].noAccidents, false);
+        assert.equal(out[0].driveType, 'awd');
     });
 
     assert.ok(captured.url.startsWith('https://www.carmax.com/cars/api/search/run?'));
@@ -847,6 +900,25 @@ test('fetchCarmax with no filters builds minimal uri=/cars', async () => {
     });
     const uri = new URL(captured).searchParams.get('uri');
     assert.equal(uri, '/cars');
+});
+
+test('fetchCarmax normalizes driveTrain to driveType, and leaves it null when absent or unrecognized', async () => {
+    const { fetchCarmax } = loadFreshApiClient();
+    const items = [
+        { stockNumber: 1, year: 2024, make: 'Hyundai', model: 'Ioniq 5', trim: 'SEL', basePrice: 27998, mileage: 20000, highlights: [], driveTrain: 'Rear Wheel Drive' },
+        { stockNumber: 2, year: 2024, make: 'Hyundai', model: 'Ioniq 5', trim: 'SEL', basePrice: 29998, mileage: 18000, highlights: [], driveTrain: 'Front Wheel Drive' },
+        { stockNumber: 3, year: 2024, make: 'Hyundai', model: 'Ioniq 5', trim: 'SEL', basePrice: 30998, mileage: 17000, highlights: [], driveTrain: 'Four Wheel Drive' },
+        { stockNumber: 4, year: 2024, make: 'Hyundai', model: 'Ioniq 5', trim: 'SEL', basePrice: 31998, mileage: 16000, highlights: [] },
+        { stockNumber: 5, year: 2024, make: 'Hyundai', model: 'Ioniq 5', trim: 'SEL', basePrice: 32998, mileage: 15000, highlights: [], driveTrain: 'Unknown Thing' }
+    ];
+    const out = await withFetchStub(async () => makeFetchResponse({ body: { items } }), async () => {
+        return fetchCarmax({ zip: '90210' }, 5);
+    });
+    assert.equal(out[0].driveType, 'rwd');
+    assert.equal(out[1].driveType, 'fwd');
+    assert.equal(out[2].driveType, '4wd');
+    assert.equal(out[3].driveType, null);
+    assert.equal(out[4].driveType, null);
 });
 
 test('fetchCarmax honours maxResults', async () => {

@@ -109,6 +109,23 @@ function normalizeFuelType(raw) {
     return null;
 }
 
+// CarMax's `driveTrain` field ("All Wheel Drive", "Rear Wheel Drive", "Front
+// Wheel Drive", "Four Wheel Drive") is the only source in this codebase that
+// exposes real structured drivetrain data — Autotrader/KBB, Cars.com, and
+// Carvana have no equivalent field (verified live 2026-09-03 against a raw
+// Carvana vehicle payload: no drivetrain key at all). Do NOT infer drivetrain
+// from trim name elsewhere — CarMax's own data shows SE trims can be AWD.
+function normalizeDriveType(raw) {
+    if (raw == null) return null;
+    const k = String(raw).toLowerCase().replace(/[\s\-]+/g, '_');
+    if (!k) return null;
+    if (k === 'all_wheel_drive' || k === 'awd') return 'awd';
+    if (k === 'rear_wheel_drive' || k === 'rwd') return 'rwd';
+    if (k === 'front_wheel_drive' || k === 'fwd') return 'fwd';
+    if (k === 'four_wheel_drive' || k === '4wd') return '4wd';
+    return null;
+}
+
 // Build the shared Cox /rest/lsc/listing query string used by both Autotrader
 // and KBB. Caller adds host- and channel-specific bits (e.g. `channel=KBB`).
 // Async because makeCode/modelCode are looked up against a runtime-fetched
@@ -167,6 +184,10 @@ function mapCoxListing(l, flavor) {
     // fuelType is reported under `fuelType.code` (e.g. "ELE", "PIH", "HYB",
     // "GSL", "DSL") on Cox listings. Some shapes use `fuelType.name`.
     const rawFuel = l.fuelType?.code || l.fuelType?.name || l.fuelType;
+    // Only present on EV/PHEV listings. Sourced from Manheim's fleet-average
+    // condition data (see healthRating/healthDescription in the raw payload),
+    // not a per-VIN sensor reading.
+    const battery = l.electricComponentInfo?.batteryDegradationInfo;
     return new CarListing({
         title,
         price: l.pricingDetail?.salePrice ? `$${Number(l.pricingDetail.salePrice).toLocaleString()}` : null,
@@ -180,7 +201,9 @@ function mapCoxListing(l, flavor) {
         isOneOwner: vhr.includes('ONE_OWNER'),
         noAccidents: vhr.includes('NO_ACCIDENTS_REPORTED'),
         personalUse: vhr.includes('PERSONAL_USE'),
-        fuelType: normalizeFuelType(rawFuel)
+        fuelType: normalizeFuelType(rawFuel),
+        batteryHealthRating: typeof battery?.healthRating === 'number' ? battery.healthRating : null,
+        batteryHealthLabel: battery?.healthDescription || null
     });
 }
 
@@ -494,7 +517,8 @@ function mapCarmaxItem(item) {
         isOneOwner: highlights.includes('singleOwner'),
         noAccidents: false,
         personalUse: false,
-        fuelType: normalizeFuelType(rawFuel)
+        fuelType: normalizeFuelType(rawFuel),
+        driveType: normalizeDriveType(item.driveTrain)
     });
 }
 
