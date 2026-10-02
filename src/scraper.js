@@ -11,13 +11,64 @@ const cargurusReference = require('./cargurusReference.js');
 // vocabulary as every other source instead of duplicating the mapping.
 // apiClient.js itself has no puppeteer dependency, so this doesn't pull
 // puppeteer in anywhere it wasn't already.
-const { normalizeFuelType, normalizeDriveType } = require('./apiClient.js');
+const { normalizeFuelType, normalizeDriveType, buildCoxListingQuery, collectCoxListings, isAkamaiBlock } = require('./apiClient.js');
 const { parsePrice } = require('./loanCalculator.js');
 
 function parseMileageStr(s) {
     if (!s) return null;
-    const digits = String(s).replace(/[^\d]/g, '');
-    return digits ? Number(digits) : null;
+    const token = String(s).trim().replace(/,/g, '').toLowerCase().split(/\s+/)[0];
+    const suffix = token.endsWith('k') ? 'k' : token.endsWith('m') ? 'm' : '';
+    const amount = Number(suffix ? token.slice(0, -1) : token);
+    const multiplier = suffix === 'k' ? 1000 : suffix === 'm' ? 1000000 : 1;
+    return Number.isFinite(amount) ? amount * multiplier : null;
+}
+
+function filterCarGurusListings(rawListings, params) {
+    const wantMake = params.make ? cargurusReference.normalize(params.make) : null;
+    const wantModel = params.model ? cargurusReference.normalize(params.model) : null;
+    return rawListings.filter(item => {
+        if (wantMake && cargurusReference.normalize(item.make) !== wantMake) return false;
+        if (wantModel && cargurusReference.normalize(item.model) !== wantModel) return false;
+        if (params.yearMin && !(Number(item.year) >= params.yearMin)) return false;
+        if (params.yearMax && !(Number(item.year) <= params.yearMax)) return false;
+        if (params.priceMax) {
+            const price = parsePrice(item.price);
+            if (!(price > 0 && price <= params.priceMax)) return false;
+        }
+        if (params.mileageMax) {
+            const mileage = parseMileageStr(item.mileage);
+            if (!(mileage != null && mileage <= params.mileageMax)) return false;
+        }
+        if (params.fuelType && normalizeFuelType(item.fuelType) !== normalizeFuelType(params.fuelType)) return false;
+        if (params.driveType && normalizeDriveType(item.driveTrain) !== params.driveType) return false;
+        if (params.searchRadius != null) {
+            const distanceText = `${item.locationCity || ''} ${item.locationDetail || ''}`.toLowerCase();
+            const marker = distanceText.indexOf(' mi away');
+            if (marker < 0) return false;
+            const distanceToken = distanceText.slice(0, marker).trim().split(/\s+/).at(-1);
+            if (!distanceToken) return false;
+            const distance = Number(distanceToken.replace(/,/g, ''));
+            if (!Number.isFinite(distance) || distance > params.searchRadius) return false;
+        }
+        return true;
+    });
+}
+
+function buildCarGurusSearchUrl(params, makeId, modelId) {
+    const qs = new URLSearchParams();
+    if (makeId && modelId) qs.set('makeModelTrimPaths', `${makeId}/${modelId}`);
+    else if (makeId) qs.set('makeModelTrimPaths', makeId);
+    qs.set('zip', params.zip || '90210');
+    qs.set('distance', String(params.searchRadius || 50));
+    qs.set('sortType', 'PRICE');
+    qs.set('sortDirection', 'ASC');
+    if (params.yearMin) qs.set('startYear', String(params.yearMin));
+    if (params.yearMax) qs.set('endYear', String(params.yearMax));
+    // Verified against the live CarGurus filter controls. The tile-level
+    // checks remain necessary because a URL filter alone is not proof.
+    if (params.fuelType === 'ev') qs.set('fuelTypes', 'ELECTRIC');
+    if (params.driveType === 'awd') qs.set('wheelSystems', 'ALL_WHEEL_DRIVE');
+    return `https://www.cargurus.com/search?${qs.toString()}`;
 }
 
 /**
@@ -38,6 +89,38 @@ function parseMileageStr(s) {
  */
 async function launchBrowser() {
     return puppeteer.launch({ headless: 'new' });
+}
+
+function needsVerifiedCoxData(params) {
+    return Boolean(params.oneOwner || params.noAccidents || params.personalUse ||
+        params.fuelType || params.driveType || params.bodyStyle || params.keyword);
+}
+
+async function fetchCoxListingsInPage(page, params, maxResults, source) {
+    const qs = await buildCoxListingQuery(params, maxResults);
+    const isKbb = source === 'KBB';
+    if (isKbb) qs.set('channel', 'KBB');
+    const path = isKbb ? '/rest/lsc/listing' : '/collections/lcServices/rest/lsc/listing';
+    const flavor = {
+        source,
+        vdpBase: `https://www.${isKbb ? 'kbb' : 'autotrader'}.com/cars-for-sale/vehicledetails.xhtml`
+    };
+    return collectCoxListings(qs, async query => {
+        const response = await page.evaluate(async (url) => {
+            const ctl = new AbortController();
+            const timer = setTimeout(() => ctl.abort(), 15000);
+            try {
+                const res = await fetch(url, {
+                    credentials: 'include', headers: { accept: 'application/json' }, signal: ctl.signal
+                });
+                return { status: res.status, body: await res.text() };
+            } finally { clearTimeout(timer); }
+        }, `${path}?${query.toString()}`);
+        if (response.status !== 200 || isAkamaiBlock(response.body)) {
+            throw new Error(`${source} browser API blocked (HTTP ${response.status})`);
+        }
+        try { return JSON.parse(response.body); } catch { throw new Error(`${source} browser API returned non-JSON`); }
+    }, flavor, params, maxResults);
 }
 
 /**
@@ -217,7 +300,18 @@ async function scrapeAutotrader(params, maxResults = 20) {
             url += '?' + urlParams.toString();
         }
 
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.goto(needsVerifiedCoxData(params)
+            ? `https://www.autotrader.com/cars-for-sale/?zip=${encodeURIComponent(zip)}`
+            : url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        // HTML cards omit verified history, fuel, and drivetrain fields. For
+        // constrained searches, use the same Cox JSON endpoint from within
+        // Chromium so Akamai sees a browser session, then run the same mapper
+        // and post-filters as the direct API path.
+        if (needsVerifiedCoxData(params)) {
+            listings.push(...await fetchCoxListingsInPage(page, params, maxResults, 'Autotrader'));
+            await browser.close();
+            return listings;
+        }
         await new Promise(r => setTimeout(r, 5000));
 
         // Extract listings
@@ -308,6 +402,11 @@ async function scrapeKBB(params, maxResults = 20) {
         if (params.mileageMax) url += `&maxMileage=${params.mileageMax}`;
 
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        if (needsVerifiedCoxData(params)) {
+            listings.push(...await fetchCoxListingsInPage(page, params, maxResults, 'KBB'));
+            await browser.close();
+            return listings;
+        }
         await new Promise(r => setTimeout(r, 5000));
 
         // Extract listings - KBB uses inventoryListing data-cmp
@@ -423,13 +522,13 @@ async function scrapeKBB(params, maxResults = 20) {
  *   - When a listing is nationwide-shippable, CarGurus's location line
  *     shows "Price includes $X shipping" instead of a distance. We surface
  *     that as-is in `location` — it's the real per-listing figure.
- *   - make/model, priceMax, and mileageMax are enforced (make/model via
+ *   - make/model, year, price, mileage, fuel, drivetrain, and an explicit
+ *     local radius are enforced from each tile (make/model via
  *     resolveMakeModel + a post-filter on the tile's own Make/Model fields;
- *     price/mileage via a post-filter on the tile's price/mileage text,
- *     since the CarGurus search URL's real query-param names for those
- *     aren't verified). `condition`, `bodyStyle`, `fuelType`, `dealRating`,
- *     and `keyword` are NOT wired through at all for this source yet — same
- *     "documented gap" posture as e.g. dealRating=fair on Autotrader/KBB.
+ *     price/mileage via tile text, since the corresponding URL parameters
+ *     have not been verified). Shipping and unknown-distance tiles are
+ *     excluded when a local radius was explicitly requested. `condition`,
+ *     `bodyStyle`, `dealRating`, and `keyword` are not wired through.
  */
 async function scrapeCarGurus(params, maxResults = 20) {
     const listings = [];
@@ -442,17 +541,7 @@ async function scrapeCarGurus(params, maxResults = 20) {
 
         const { makeId, modelId } = await cargurusReference.resolveMakeModel(page, params.make, params.model);
 
-        const qs = new URLSearchParams();
-        if (makeId && modelId) qs.set('makeModelTrimPaths', `${makeId}/${modelId}`);
-        else if (makeId) qs.set('makeModelTrimPaths', makeId);
-        qs.set('zip', params.zip || '90210');
-        qs.set('distance', String(params.searchRadius || 50));
-        qs.set('sortType', 'PRICE');
-        qs.set('sortDirection', 'ASC');
-        if (params.yearMin) qs.set('startYear', String(params.yearMin));
-        if (params.yearMax) qs.set('endYear', String(params.yearMax));
-
-        const url = `https://www.cargurus.com/search?${qs.toString()}`;
+        const url = buildCarGurusSearchUrl(params, makeId, modelId);
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
         // The location section (city/distance or shipping-fee text) hydrates
         // asynchronously after the tiles themselves paint — a flat sleep here
@@ -521,24 +610,7 @@ async function scrapeCarGurus(params, maxResults = 20) {
         // make/model that CarGurus's ID index doesn't recognize can't return
         // unrelated vehicles. Same normalize() used to build that index, so
         // spacing/hyphen/case variants (e.g. "Ioniq 5" vs "Ioniq5") still match.
-        const wantMake = params.make ? cargurusReference.normalize(params.make) : null;
-        const wantModel = params.model ? cargurusReference.normalize(params.model) : null;
-        const filtered = rawListings.filter(item => {
-            if (wantMake && cargurusReference.normalize(item.make) !== wantMake) return false;
-            if (wantModel && cargurusReference.normalize(item.model) !== wantModel) return false;
-            // priceMax/mileageMax aren't wired into the CarGurus search URL
-            // (unverified param names) — post-filter on the tile's own
-            // price/mileage text instead of returning them unfiltered.
-            if (params.priceMax) {
-                const price = parsePrice(item.price);
-                if (price != null && price > params.priceMax) return false;
-            }
-            if (params.mileageMax) {
-                const mileage = parseMileageStr(item.mileage);
-                if (mileage != null && mileage > params.mileageMax) return false;
-            }
-            return true;
-        });
+        const filtered = filterCarGurusListings(rawListings, params);
 
         for (const item of filtered.slice(0, maxResults)) {
             const title = [item.year, item.make, item.model, item.trim].filter(Boolean).join(' ') || null;
@@ -615,5 +687,7 @@ module.exports = {
     scrapeAutotrader,
     scrapeKBB,
     scrapeCarGurus,
+    filterCarGurusListings,
+    buildCarGurusSearchUrl,
     searchAllSources
 };

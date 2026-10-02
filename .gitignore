@@ -29,6 +29,7 @@ coverage/
 *.backup
 tmp/
 .tmp/
+results/
 
 # HARs are large captures with potential PII; never commit. Reference paths
 # in CLAUDE.md point to `~/Downloads/*.har` on the maintainer's machine.

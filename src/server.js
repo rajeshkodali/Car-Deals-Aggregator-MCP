@@ -38,7 +38,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         tools: [
             {
                 name: 'search_car_deals',
-                description: 'Search car listings across Cars.com, Autotrader, and KBB. Only zip is required; all other filters optional. When the user is shopping for a car, ask them for: budget (priceMax), zip, body style (sedan/SUV/truck/etc), and fuel preference (gas/hybrid/EV). For monthly cost estimates, also collect age bracket and (optionally) loan terms. Returns listings with optional monthly payment + ZIP-area insurance estimate.',
+                description: 'Search car listings across six sources. Only zip is required. For a broad search, pass all six sources and maxResults of at least 50. Translate every required constraint into a typed filter: EV uses fuelType=ev, AWD uses driveType=awd, single owner uses oneOwner=true, and no accidents uses noAccidents=true. A keyword alone does not verify drivetrain. Returns listings with optional monthly payment and ZIP-area insurance estimate.',
                 inputSchema: {
                     type: 'object',
                     properties: {
@@ -68,11 +68,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         oneOwner: { type: 'boolean', description: 'Optional. CARFAX 1-Owner only.' },
                         noAccidents: { type: 'boolean', description: 'Optional. No reported accidents.' },
                         personalUse: { type: 'boolean', description: 'Optional. Personal use only (no rental/fleet).' },
-                        maxResults: { type: 'integer', description: 'Optional. Max results per source (default 10).' },
+                        maxResults: { type: 'integer', description: 'Optional. Max matching results per source (default 10; use at least 50 for a broad search).' },
                         sources: {
                             type: 'array',
                             items: { type: 'string' },
-                            description: 'Optional. Sources to query: "cars.com", "autotrader", "kbb", "carmax", "carvana", "cargurus". Default: cars.com + autotrader.',
+                            description: 'Optional. Sources to query: "cars.com", "autotrader", "kbb", "carmax", "carvana", "cargurus". Pass all six for a broad search; unsupported sources are reported as skipped when strict filters require it. Default: cars.com + autotrader.',
                         },
                         bodyStyle: {
                             type: 'string',
@@ -83,6 +83,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                             type: 'string',
                             enum: ['gas', 'hybrid', 'ev', 'plugin_hybrid', 'diesel'],
                             description: 'Optional. Fuel/powertrain type. Ask the user (gas / hybrid / EV).',
+                        },
+                        driveType: {
+                            type: 'string',
+                            enum: ['awd', '4wd', 'fwd', 'rwd'],
+                            description: 'Optional. Verified drivetrain from each listing; use "awd" for all-wheel drive.',
                         },
                         ageBucket: {
                             type: 'string',
@@ -113,15 +118,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 //   - Akamai/Cloudflare blocks (AkamaiBlockError)
 //   - Schema mismatch (non-JSON, missing expected top-level field)
 //   - Network / timeout (TimeoutError, native fetch errors)
+// A thrown error is necessary but not sufficient: Cars.com HTML fallback
+// is suppressed when it cannot verify the requested hard filters.
 
 async function searchCarscom(params, maxResults) {
+    let fetchError;
     try {
         const listings = await fetchCarscom(params, maxResults);
         console.error(`[MCP] Cars.com fetch: ${listings.length} listings`);
         return { source: 'Cars.com', listings };
     } catch (err) {
-        console.error(`[MCP] Cars.com fetch failed (${err.message}), falling back to Puppeteer`);
+        fetchError = err;
+        console.error(`[MCP] Cars.com fetch failed (${err.message})`);
     }
+    // HTML cards do not carry enough structured data to verify these filters.
+    if (params.fuelType || params.bodyStyle || params.keyword || params.personalUse ||
+        params.searchRadius != null || params.dealRating || params.condition === 'new') {
+        return { source: 'Cars.com', listings: [], error: `API failed (${fetchError.message}); HTML fallback cannot verify requested filters` };
+    }
+    console.error('[MCP] Cars.com trying Puppeteer fallback');
     try {
         const listings = await scrapeCarscom(params, maxResults);
         return { source: 'Cars.com', listings };
@@ -163,11 +178,13 @@ async function searchKBB(params, maxResults) {
 }
 
 async function searchCarmax(params, maxResults) {
+    let fetchError;
     try {
         const listings = await fetchCarmax(params, maxResults);
         console.error(`[MCP] CarMax fetch: ${listings.length} listings`);
         return { source: 'CarMax', listings };
     } catch (err) {
+        fetchError = err;
         console.error(`[MCP] CarMax fetch failed (${err.message}), trying HTML fallback`);
     }
     try {
@@ -176,8 +193,8 @@ async function searchCarmax(params, maxResults) {
         return { source: 'CarMax', listings };
     } catch (err) {
         console.error(`[MCP] CarMax HTML fallback failed (${err.message})`);
+        return { source: 'CarMax', listings: [], error: `API failed (${fetchError.message}); HTML fallback failed (${err.message})` };
     }
-    return { source: 'CarMax', listings: [] };
 }
 
 async function searchCarvana(params, maxResults) {
@@ -190,6 +207,7 @@ async function searchCarvana(params, maxResults) {
         console.error('[MCP] Carvana fetch returned 0 listings');
     } catch (err) {
         console.error(`[MCP] Carvana fetch failed (${err.message})`);
+        return { source: 'Carvana', listings: [], error: err.message };
     }
     return { source: 'Carvana', listings: [] };
 }
@@ -204,9 +222,20 @@ async function searchCarGurus(params, maxResults) {
         return { source: 'CarGurus', listings };
     } catch (err) {
         console.error('[MCP] CarGurus scrape failed:', err.message);
+        return { source: 'CarGurus', listings: [], error: err.message };
     }
-    return { source: 'CarGurus', listings: [] };
 }
+
+// Each source worker owns its fetch/fallback policy. The orchestrator starts
+// them together and hands completed envelopes to the shared result combiner.
+const SOURCE_WORKERS = new Map([
+    ['cars.com', searchCarscom],
+    ['autotrader', searchAutotrader],
+    ['kbb', searchKBB],
+    ['carmax', searchCarmax],
+    ['carvana', searchCarvana],
+    ['cargurus', searchCarGurus]
+]);
 
 // Exported for direct test invocation — wraps the same logic the MCP
 // CallTool handler does, minus the `name`/`arguments` envelope. Returns
@@ -230,6 +259,7 @@ async function handleSearchCarDeals(args = {}) {
             personalUse: args.personalUse,
             bodyStyle: args.bodyStyle,
             fuelType: args.fuelType,
+            driveType: args.driveType,
         };
         const maxResults = args.maxResults || 10;
         const rawSources = (args.sources && args.sources.length) ? args.sources : ['cars.com', 'autotrader'];
@@ -245,7 +275,7 @@ async function handleSearchCarDeals(args = {}) {
         }
         const sources = normalizedSources;
 
-        // Per-source CARFAX-filter capability table. true = the source can
+        // Per-source history, drivetrain, and radius capability table. true = the source can
         // honour the filter end-to-end (the fetcher actually wires it
         // through, server-side or via post-filter, with verifiable effect
         // on results). false = the source either has no per-listing data
@@ -262,11 +292,11 @@ async function handleSearchCarDeals(args = {}) {
         // filters, rather than silently returning unfiltered rows.
         // `personalUse` IS sent and works.
         const SOURCE_CAPABILITIES = {
-            'cars.com':   { oneOwner: false, noAccidents: false, personalUse: true  },
-            'autotrader': { oneOwner: true,  noAccidents: true,  personalUse: true  },
-            'kbb':        { oneOwner: true,  noAccidents: true,  personalUse: true  },
-            'carmax':     { oneOwner: true,  noAccidents: false, personalUse: false },
-            'carvana':    { oneOwner: false, noAccidents: false, personalUse: false },
+            'cars.com':   { oneOwner: false, noAccidents: false, personalUse: true, driveType: false, searchRadius: true },
+            'autotrader': { oneOwner: true,  noAccidents: true,  personalUse: true, driveType: true, searchRadius: true },
+            'kbb':        { oneOwner: true,  noAccidents: true,  personalUse: true, driveType: true, searchRadius: true },
+            'carmax':     { oneOwner: true,  noAccidents: false, personalUse: false, driveType: true, searchRadius: false },
+            'carvana':    { oneOwner: false, noAccidents: false, personalUse: false, driveType: false, searchRadius: false },
             // CarGurus's SRP tile carries no per-listing CARFAX-equivalent field
             // (no owner-history/accident data in its <dl>), even though the
             // real site's /search URL accepts a vehicleHistoryOptions param
@@ -275,9 +305,9 @@ async function handleSearchCarDeals(args = {}) {
             // and even if it does we'd have no per-listing field to back the
             // badge with. Same conservative posture as Carvana until that's
             // verified live.
-            'cargurus':   { oneOwner: false, noAccidents: false, personalUse: false }
+            'cargurus':   { oneOwner: false, noAccidents: false, personalUse: false, driveType: true, searchRadius: true }
         };
-        // For each requested CARFAX filter, find sources that can't honour
+        // For each requested history, drivetrain, or explicit radius filter, find sources that can't honour
         // it and record a skip reason. We exclude those sources from the
         // tasks list rather than returning unfiltered listings that look
         // filtered.
@@ -286,16 +316,18 @@ async function handleSearchCarDeals(args = {}) {
             if (!skippedBy.has(sourceKey)) skippedBy.set(sourceKey, []);
             skippedBy.get(sourceKey).push(reason);
         }
-        const requestedFlags = ['oneOwner', 'noAccidents', 'personalUse'].filter(f => params[f]);
+        const requestedFlags = ['oneOwner', 'noAccidents', 'personalUse', 'driveType'].filter(f => params[f]);
+        if (args.searchRadius != null) requestedFlags.push('searchRadius');
         const eligibleSources = sources.filter(s => {
             const caps = SOURCE_CAPABILITIES[s];
+            let eligible = true;
             for (const f of requestedFlags) {
                 if (!caps[f]) {
-                    recordSkip(s, `${f}=true not enforceable`);
-                    return false;
+                    recordSkip(s, `${f}=${params[f]} not enforceable`);
+                    eligible = false;
                 }
             }
-            return true;
+            return eligible;
         });
 
         const includeEstimates = args.includeEstimates !== false;
@@ -322,13 +354,7 @@ async function handleSearchCarDeals(args = {}) {
             console.error(`[MCP] Unknown sources ignored: ${unknownSources.join(', ')}`);
         }
 
-        const tasks = [];
-        if (eligibleSources.includes('cars.com')) tasks.push(searchCarscom(params, maxResults));
-        if (eligibleSources.includes('autotrader')) tasks.push(searchAutotrader(params, maxResults));
-        if (eligibleSources.includes('kbb')) tasks.push(searchKBB(params, maxResults));
-        if (eligibleSources.includes('carmax')) tasks.push(searchCarmax(params, maxResults));
-        if (eligibleSources.includes('carvana')) tasks.push(searchCarvana(params, maxResults));
-        if (eligibleSources.includes('cargurus')) tasks.push(searchCarGurus(params, maxResults));
+        const tasks = eligibleSources.map(source => SOURCE_WORKERS.get(source)(params, maxResults));
 
         const insurancePromise = includeEstimates
             ? estimateInsurance(insuranceOpts).catch(err => {
@@ -413,6 +439,7 @@ async function handleSearchCarDeals(args = {}) {
         if (params.dealRating) output += ` | Deal Rating: ${params.dealRating}`;
         if (params.bodyStyle) output += ` | Body: ${params.bodyStyle}`;
         if (params.fuelType) output += ` | Fuel: ${params.fuelType}`;
+        if (params.driveType) output += ` | Drivetrain: ${params.driveType.toUpperCase()}`;
 
         const carfaxFilters = [];
         if (params.oneOwner) carfaxFilters.push('1-Owner');
@@ -458,7 +485,9 @@ async function handleSearchCarDeals(args = {}) {
         }
 
         if (allListings.length === 0) {
-            output += `No listings found.\n`;
+            if (eligibleSources.length === 0) output += `No selected sources can verify all requested filters.\n`;
+            else if (results.every(r => r.error)) output += `Search could not be completed: every eligible source failed.\n`;
+            else output += `No listings found.\n`;
         } else {
             output += `Found **${allListings.length}** listings:\n\n`;
             for (const listing of allListings) {
@@ -500,7 +529,8 @@ async function handleSearchCarDeals(args = {}) {
             for (const err of errors) output += `- ${err}\n`;
         }
 
-        return { content: [{ type: 'text', text: output }] };
+        const allSourcesFailed = results.length > 0 && results.every(r => r.error);
+        return { content: [{ type: 'text', text: output }], ...(allSourcesFailed ? { isError: true } : {}) };
     } catch (error) {
         return {
             content: [{ type: 'text', text: `Error searching for car deals: ${error.message}` }],

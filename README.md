@@ -8,6 +8,7 @@ Supported sources:
 - KBB
 - CarMax
 - Carvana
+- CarGurus
 
 ---
 
@@ -15,7 +16,7 @@ Supported sources:
 
 ### 1) Prerequisites
 
-- Node.js `20+` (Node `22+` recommended — uses global `fetch` from Node 22)
+- Node.js `22+`
 - npm
 - Chrome/Chromium available locally (needed for Puppeteer fallback and Cars.com API-key bootstrap)
 
@@ -96,6 +97,7 @@ Each listing includes:
 - dealer/location (if available)
 - source name
 - direct listing URL
+- verified drivetrain when the source provides it, plus a dealer delivery note when advertised (destination ZIP must be confirmed)
 
 If `includeEstimates` is not disabled, the output also includes:
 - estimated monthly loan payment
@@ -127,15 +129,18 @@ If you do not provide enough detail, the assistant should ask follow-up question
 
 ## Source Behavior (Important)
 
-- Default sources are `cars.com` + `autotrader`. KBB, CarMax, and Carvana are opt-in via `sources`.
+- Default sources are `cars.com` + `autotrader`. For a broad search, pass all six sources and `maxResults` of at least 50; use a higher limit when you need a complete listing set.
 - Autotrader and KBB share Cox Automotive's listing backend; duplicate listings (same `listingId`) are collapsed to one (Autotrader wins).
+- Cox searches page through larger result sets and split them by year and price when the endpoint's deep-page limit is reached.
 - Radius semantics differ by source:
   - Cars.com, Autotrader, and KBB honor `searchRadius` (Cars.com post-filtered by haversine distance — server-side filter is unreliable)
-  - Carvana inventory is **nationwide** — `searchRadius` is ignored
-  - CarMax returns nearby + transferable inventory; no strict radius filter
+  - Carvana inventory is **nationwide** — the orchestrator skips it when `searchRadius` is explicit
+  - CarMax returns nearby + transferable inventory; the orchestrator skips it when `searchRadius` is explicit
 - CarMax tries its JSON API first; on failure falls back to HTML extraction (`fetchCarmaxFromHtml`) — no Puppeteer required.
 - Carvana is API-only (no Puppeteer fallback; the SRP is Cloudflare-gated).
-- If a requested history/CARFAX filter cannot be enforced for a selected source, that source is **skipped entirely** and a caveat line appears in the output.
+- CarGurus is Puppeteer-only. EV and AWD are sent as site filters and checked again on each listing card.
+- If a requested history/CARFAX filter, drivetrain, or explicit radius cannot be enforced for a selected source, that source is **skipped entirely** and a caveat line appears in the output.
+- For strict EV + AWD + one-owner + no-accident searches, Autotrader and KBB can verify all four conditions from structured listings. CarMax lacks accident history; Cars.com, Carvana, and CarGurus lack per-listing history flags. CarMax and Carvana do not enforce a local radius.
 
 ---
 
