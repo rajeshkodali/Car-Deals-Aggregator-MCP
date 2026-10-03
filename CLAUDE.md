@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-- `npm run test:unit` — full offline `node:test` suite (~230ms, 177 tests). Use this for CI and local iteration.
+- `npm run test:unit` — full offline `node:test` suite. Use this for CI and local iteration.
 - `node --test test/apiClient.test.js` — run a single test file. Append `--test-name-pattern="<regex>"` to scope to one test.
 - `npm start` — boot the MCP server over stdio (entry: `src/server.js`).
 - `npm test` — **live** Puppeteer smoke against Cars.com. Hits the network, slow, do not run in CI.
@@ -17,26 +17,34 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 2. One URL per car — if the same listing appears on multiple sources, pick one: Cars.com > Autotrader > KBB. Never duplicate rows or show two links for the same car.
 3. Sanity check: if a user reading in a plain monospace terminal would only see the word "Link", you've done it wrong.
 
-**Default search behavior:** Always include all 6 sources (`cars.com`, `autotrader`, `kbb`, `carmax`, `carvana`, `cargurus`) and set `maxResults` ≥ 50 unless the user says otherwise.
+**Default search behavior:** Always include all 6 sources (`cars.com`, `autotrader`, `kbb`, `carmax`, `carvana`, `cargurus`) and set `maxResults` ≥ 50 unless the user says otherwise. Requested hard constraints still determine source eligibility: an explicit `searchRadius` excludes CarMax and Carvana, and `driveType` excludes Cars.com and Carvana. Report the emitted caveats; requesting all six sources does not guarantee all six can participate.
 
 ## Architecture (v3)
+
+**2026-10-02 update:** The current code pages Cox results with `firstRecord` and splits large queries by year and price because the live endpoint returns `{}` at deep offsets. Cox `owner.homeServices.vehicleDelivery` is shown as a dealer delivery offer; delivery eligibility for a specific ZIP is not verified. CarGurus EV/AWD queries use live-verified `fuelTypes=ELECTRIC` and `wheelSystems=ALL_WHEEL_DRIVE`, followed by tile-level checks. See `src/` and `test/` for current behavior when older notes below conflict.
 
 Two-tier strategy per source:
 
 1. **`src/apiClient.js` — direct `fetch` to internal JSON/GraphQL APIs.** Fast, structured, no browser. Tried first.
-2. **`src/scraper.js` — Puppeteer + stealth.** Fallback when (1) errors or returns 0 listings.
+2. **`src/scraper.js` — Puppeteer + stealth.** Fallback only when (1) throws and the browser path can enforce the requested filters. A successful zero-listing response never triggers fallback.
 
-`src/server.js` orchestrates: `searchCarscom` / `searchAutotrader` / `searchKBB` / `searchCarmax` / `searchCarvana` / `searchCarGurus`. The first three try fetch first and fall through to Puppeteer **only on a thrown error** (HTTP non-200, AkamaiBlockError, schema mismatch, or timeout). A clean 200 with zero results does NOT trigger fallback — that just spends a Puppeteer launch on a query the user phrased narrowly. **CarMax** tries its JSON API first, falls through to a *no-Puppeteer* HTML-extract fallback (`fetchCarmaxFromHtml`) on the same error-only conditions — see CarMax section. **Carvana** is API-only; the SRP HTML page is Cloudflare-gated, so a fallback would require Puppeteer and hasn't been built. **CarGurus** is the mirror image of Carvana: Puppeteer-only, no fetch tier at all — every cargurus.com endpoint (reference lookups and the SRP page itself) sits behind a DataDome TLS/HTTP2-fingerprint block that rejects plain Node `fetch` outright, so there's nothing to fall back *from* — see CarGurus section below. KBB and Autotrader share Cox Automotive's `/rest/lsc/listing` endpoint under different hosts (see KBB section below). **Result dedup is scoped to Autotrader ↔ KBB only** — same `listingId` from both is collapsed to one (Autotrader wins). Cars.com, CarMax, Carvana, and CarGurus all have independent inventory and are never deduped against anything. Cars.com uses `/vehicledetail/{id}/` URLs which don't match the Cox `listingId=` pattern, so they pass through untouched.
+`src/server.js` orchestrates: `searchCarscom` / `searchAutotrader` / `searchKBB` / `searchCarmax` / `searchCarvana` / `searchCarGurus`. The first three try fetch first; a thrown error (HTTP non-200, AkamaiBlockError, schema mismatch, or timeout) is required for Puppeteer fallback. **Cars.com additionally suppresses HTML fallback** when `fuelType`, `bodyStyle`, `keyword`, `personalUse`, an explicit `searchRadius`, `dealRating`, or `condition: 'new'` is requested: its HTML cards cannot verify these constraints. It returns a source error explaining the suppression. A clean 200 with zero results does NOT trigger fallback — that just spends a Puppeteer launch on a query the user phrased narrowly. **CarMax** tries its JSON API first, falls through to a *no-Puppeteer* HTML-extract fallback (`fetchCarmaxFromHtml`) on the same error-only conditions — see CarMax section. **Carvana** is API-only; the SRP HTML page is Cloudflare-gated, so a fallback would require Puppeteer and hasn't been built. **CarGurus** is the mirror image of Carvana: Puppeteer-only, no fetch tier at all — every cargurus.com endpoint (reference lookups and the SRP page itself) sits behind a DataDome TLS/HTTP2-fingerprint block that rejects plain Node `fetch` outright, so there's nothing to fall back *from* — see CarGurus section below. KBB and Autotrader share Cox Automotive's `/rest/lsc/listing` endpoint under different hosts (see KBB section below). **Result dedup is scoped to Autotrader ↔ KBB only** — same `listingId` from both is collapsed to one (Autotrader wins). Cars.com, CarMax, Carvana, and CarGurus all have independent inventory and are never deduped against anything. Cars.com uses `/vehicledetail/{id}/` URLs which don't match the Cox `listingId=` pattern, so they pass through untouched.
 
-### Per-source CARFAX-filter capability
+Autotrader/KBB's Puppeteer path chooses its mechanism by query. With any of `oneOwner`, `noAccidents`, `personalUse`, `fuelType`, `driveType`, `bodyStyle`, or `keyword`, it navigates to the marketplace and uses in-browser `fetch()` with cookies against the **same Cox JSON endpoint** used by the direct tier, sharing query construction, parsing, pagination, and post-filters. Other queries use HTML cards. The browser context can overcome transport/cookie blocks, but the JSON path is not an independent fallback for endpoint outages or schema changes; it fails rather than returning unverifiable HTML matches.
+
+Cox pagination treats exactly `{}` on a later page as end-of-results and retains listings already collected. An empty object on the first page, other malformed shapes, and thrown page-load errors remain source failures.
+
+### Per-source hard-filter capability
 
 | Filter        | Cars.com   | Autotrader | KBB | CarMax              | Carvana | CarGurus |
 |---------------|------------|------------|-----|---------------------|---------|----------|
 | `oneOwner`    | ✗ (note)   | ✓          | ✓   | ✓ (`singleOwner`)   | ✗       | ✗        |
 | `noAccidents` | ✗ (note)   | ✓          | ✓   | ✗                   | ✗       | ✗        |
 | `personalUse` | ✓          | ✓          | ✓   | ✗                   | ✗       | ✗        |
+| `driveType`   | ✗          | ✓          | ✓   | ✓                   | ✗       | ✓        |
+| Explicit `searchRadius` | ✓ | ✓         | ✓   | ✗                   | ✗       | ✓        |
 
-When the caller passes a CARFAX filter and a source can't enforce it per-listing, `server.js` **skips that source entirely** rather than returning unfiltered rows that would render with badges they can't back up. The rendered output surfaces a one-line caveat (`> carvana: oneOwner=true not enforceable`). Cox endpoints (Autotrader/KBB) post-filter on `vhrPreview`.
+When the caller passes a history filter, `driveType`, or an explicit `searchRadius` and a source can't enforce it, `server.js` **skips that source entirely** rather than returning unfiltered rows that would render with badges they can't back up. The rendered output surfaces a one-line caveat (`> carvana: oneOwner=true not enforceable`). Cox endpoints (Autotrader/KBB) post-filter history on `vhrPreview` and drivetrain on structured data. Omitting `searchRadius` retains CarMax/Carvana as eligible sources despite the default 50-mile search hint; their inventory is transferable/nationwide and is not strictly local.
 
 > **Cars.com `oneOwner` / `noAccidents` note:** Cars.com's GraphQL `SearchResultsPageSearch` operation accepts `one_owner` and `no_accidents` filter values, but sending either causes the response to come back as a "ghost" — `totalListings=0` and empty `analytics.context` — which drops every real listing. So `buildCarscomFilters()` in `apiClient.js` deliberately does NOT send those two filters, and the capability table therefore marks Cars.com as **not** supporting them. Result: a request with `oneOwner: true` skips Cars.com entirely (with the caveat in the output) rather than silently returning unfiltered Cars.com rows. `personalUse` works fine and IS sent. We also do not propagate caller intent into per-listing CARFAX flags for any source — that prior behavior produced badges that claimed verification we couldn't back up.
 
@@ -63,7 +71,7 @@ Results bundle these into a per-listing total: `loan + insurance + monthly fees`
 
 `search_car_deals` — only `zip` is required. Everything else is optional.
 
-**Listing filters:** `make`, `model`, `keyword` (free text), `yearMin/Max`, `priceMax`, `mileageMax`, `searchRadius`, `condition` (`new`/`used`), `dealRating` (`great`/`good`/`fair`), `oneOwner`, `noAccidents`, `personalUse`, `bodyStyle` (`sedan`/`suv`/`truck`/`coupe`/`hatchback`/`convertible`/`wagon`/`minivan`/`van`), `fuelType` (`gas`/`hybrid`/`ev`/`plugin_hybrid`/`diesel`), `maxResults`, `sources`. Default sources: `['cars.com', 'autotrader']`. KBB, CarMax, Carvana, and CarGurus are opt-in.
+**Listing filters:** `make`, `model`, `keyword` (free text), `driveType` (`awd`), `yearMin/Max`, `priceMax`, `mileageMax`, `searchRadius`, `condition` (`new`/`used`), `dealRating` (`great`/`good`/`fair`), `oneOwner`, `noAccidents`, `personalUse`, `bodyStyle` (`sedan`/`suv`/`truck`/`coupe`/`hatchback`/`convertible`/`wagon`/`minivan`/`van`), `fuelType` (`gas`/`hybrid`/`ev`/`plugin_hybrid`/`diesel`), `maxResults`, `sources`. Default sources: `['cars.com', 'autotrader']`. KBB, CarMax, Carvana, and CarGurus are opt-in.
 
 > **dealRating coverage:** `great` and `good` filter on all three sources (Cars.com via `deal_ratings` GraphQL filter; Autotrader + KBB via Cox `dealType=greatprice|goodprice` plus a defensive post-filter on the per-listing rating). `fair` only filters on Cars.com — Cox's JS bundle declares only `greatprice` and `goodprice` as filter values, so on Autotrader/KBB we silently no-op rather than send a value the API ignores. Per-listing dealRating still appears in the result text.
 
@@ -134,12 +142,12 @@ Sending `oneOwner=true` and `noAccidents=true` as query params **does not actual
 - The full SRP query in the HAR is ~13 KB; we use a minimal version that asks only for `metadata { totalListings totalPages }` and `results { listingId analytics { context } }`. Adjust `src/apiClient.js:CARSCOM_SRP_QUERY` if you need more fields.
 
 #### Cars.com response does NOT expose CARFAX flags directly
-Probed schema: `analytics.context` (a JSON-stringified blob with `year`, `make`, `model`, `price`, `mileage`, `vin`, `seller`, etc.) does NOT contain `oneOwner`, `noAccidents`, or `personalUse` fields. The `body` field is type `Stack` (rendered card content with badges) but introspection failed (`children` is not a queryable field). Rather than reverse-engineer the badge structure, we **trust the server-side filter**: when the caller passes `oneOwner: true`/`noAccidents: true`, we send those filters in the GraphQL request and propagate the caller's intent into the returned listing's flags. Verified (2026-05-14) that Cars.com's server-side filter actually works (sending both filters drops result count from 6 → 1 in spot-checks).
+Probed schema: `analytics.context` (a JSON-stringified blob with `year`, `make`, `model`, `price`, `mileage`, `vin`, `seller`, etc.) does NOT contain `oneOwner`, `noAccidents`, or `personalUse` fields. The `body` field is type `Stack` (rendered card content with badges) but introspection failed (`children` is not a queryable field). The current implementation does not send `oneOwner`/`noAccidents` (they produce ghost responses), and never propagates caller intent into listing-history flags. Those two flags remain false, and the orchestrator skips Cars.com when either is required. `personalUse` is sent server-side but is not verified by a per-listing flag. The older 2026-05-14 probe is superseded by the current behavior described above.
 
 #### Cars.com `area` filter leaks listings far outside the requested radius (2026-05-15)
 Real-world reproduction: searching `zip=98033, searchRadius=100` for Hyundai Ioniq 5 returned 34 listings, **20 of them outside 100mi** — Oregon (97xxx ZIPs ~150-210mi away), California (94103 ~810mi), Colorado (80538 ~1,200mi), Maryland (20613 ~2,700mi). The server-side `area` filter is unreliable.
 
-**Fix:** post-filter on haversine distance from `params.zip` to each listing's `analytics.context.seller.zip`. Implemented in `fetchCarscom` via `src/zipDistance.js`. Listings whose seller ZIP is >`searchRadius` miles from the search ZIP are dropped. Fail-open: if either ZIP can't be resolved, the listing is kept (better to over-include than over-drop). Verified live (2026-05-15): the same 34→16 query collapsed correctly to only WA ZIPs.
+**Fix:** post-filter on haversine distance from `params.zip` to each listing's `analytics.context.seller.zip`. Implemented in `fetchCarscom` via `src/zipDistance.js`. Listings whose seller ZIP is >`searchRadius` miles from the search ZIP are dropped. With an explicit `searchRadius`, missing or unresolvable ZIPs drop the listing because its distance cannot be verified. With the implicit default radius, lookup failures keep the listing (fail-open). Verified live (2026-05-15): the same 34→16 query collapsed correctly to only WA ZIPs.
 
 Cox endpoints (Autotrader/KBB) don't appear to have this leak — their `searchRadius` is honored — so we only post-filter Cars.com.
 
@@ -159,7 +167,7 @@ The query params and most of the response shape are identical to Autotrader. `sr
 
 `vhrPreview` works identically (`ONE_OWNER`, `NO_ACCIDENTS_REPORTED`, `PERSONAL_USE`, etc.) — same post-filter logic. Listing URL is constructed the same way: `https://www.kbb.com/cars-for-sale/vehicledetails.xhtml?listingId=${l.id}`.
 
-The Puppeteer fallback (`scrapeKBB` in `src/scraper.js`) is still wired in case the Cox endpoint blocks or schemas drift.
+The Puppeteer fallback (`scrapeKBB` in `src/scraper.js`) uses browser-context Cox JSON for queries requiring structured verification, and HTML cards otherwise. Browser JSON shares the primary endpoint and schema, so it does not recover from endpoint outages or schema drift.
 
 ### CarGurus (2026-09-04)
 
@@ -325,7 +333,7 @@ This section is the canonical reference for which endpoints work from Node's `fe
 
 #### CarMax SRP HTML fallback (2026-05-22)
 
-`fetchCarmaxFromHtml(params, maxResults)` parses the CarMax SRP HTML page when the JSON API returns 0 listings or errors. The SRP at `https://www.carmax.com{uri}?zipCode=...&distance=...` server-renders the listing array as a global JS variable for SEO + first paint:
+`fetchCarmaxFromHtml(params, maxResults)` parses the CarMax SRP HTML page when the JSON API throws; a successful zero-listing response does not trigger this fallback. The SRP at `https://www.carmax.com{uri}?zipCode=...&distance=...` server-renders the listing array as a global JS variable for SEO + first paint:
 
 ```html
 <script>
@@ -336,12 +344,12 @@ This section is the canonical reference for which endpoints work from Node's `fe
 </script>
 ```
 
-- Same `uri` builder as the API (`buildCarmaxUri`), used as the actual SRP path. Just append `&zipCode=` + `&distance=` for store-radius filtering.
+- Same `uri` builder as the API (`buildCarmaxUri`), used as the actual SRP path. Append `&zipCode=` + `&distance=` as location hints; these do not establish a strict inventory radius. The orchestrator excludes CarMax when a radius is explicit.
 - **Field names match the API exactly** (`basePrice`, `stockNumber`, `storeCity`, `highlights`, `priorUseDescriptions`, ...) — both code paths share `mapCarmaxItem` so the output `CarListing` shape is identical.
 - **Not Cloudflare-gated.** Verified live (2026-05-22) — plain Node `fetch` returns 200 with the embedded array.
 - **Page is single-page only** — capped at 24 listings (CarMax's page size). `?skip=` is ignored on the SRP, so this fallback can't paginate. Fine for fallback duty.
 - Extraction regex: `const cars\s*=\s*(\[[\s\S]*?\]);` then `JSON.parse`. The body is JSON-compatible (CarMax serializes via `JSON.stringify`).
-- Live-verified: API → 0/throw → HTML fallback returns real listings (e.g. 5 Toyota Camrys near 98033).
+- Live-verified: API throw → HTML fallback (zero-result success no longer triggers fallback) returns real listings (e.g. 5 Toyota Camrys near 98033).
 
 ### Carvana search API (2026-05-17)
 
@@ -350,7 +358,7 @@ This section is the canonical reference for which endpoints work from Node's `fe
 - Request body JSON: `{ filters: { price, year, mileage, bodyStyles, fuelTypes, makes }, pagination: { page, pageSize }, sortBy, zip5, requestedFeatures, analyticsData, browserCookieId }`.
 - `makes` filter is `[{ name: "Hyundai", parentModels: [{ name: "IONIQ 5" }] }]` — **model name is exact-match against Carvana's stored casing**, which is inconsistent across the catalog. Title-case for plain word-models (`Camry`, `Corolla`, `4Runner`, `C-HR`) and all-caps for stylized names (`RAV4`, `IONIQ 5`, `EV6`, `ID.4`). Forced uppercasing of all models *breaks* anything stored title-case (e.g. `CAMRY` returns 0). The code resolves user-supplied model strings via Carvana's typeahead — `resolveCarvanaModelName(make, model)` GETs `https://apik.carvana.io/merch/search/api/v4/suggest?query=<make> <model>` and reads the canonical casing from the first suggestion whose `filters.makes[].name` matches the user's make: `suggestions[].filters.makes[].parentModels[0].name`. Cached per `(make, model)` pair for the process lifetime. On miss the user's input passes through unchanged. Live-verified across `rav4`, `RAV4`, `Camry`, `CAMRY`, `Ioniq 5`, `ioniq 5`, `ev6`, `4runner`, `c-hr`.
   - `/v4/suggest` is a plain GET, no auth, no cookies, no headers required (we still send `origin`/`referer`/UA defensively). Tiny response, fast.
-- **Nationwide inventory, no radius filter.** Carvana delivers nationwide; `drivingMiles` in the response is distance to nearest hub, not a filter. Do not pass `searchRadius` — it is silently ignored.
+- **Nationwide inventory, no radius filter.** Carvana delivers nationwide; `drivingMiles` in the response is distance to nearest hub, not a filter. The direct client does not enforce `searchRadius`; the orchestrator excludes Carvana when that constraint is explicitly requested and emits a caveat.
 - **`LocationBasedPrefiltering` in `requestedFeatures` suppresses all results** — do not include it. Use only `['ExcludeFacetData', 'HideImpossibleCombos', 'LoanTermPricing']`.
 - No one-owner / no-accident fields. Carvana inspects and reconditions all vehicles. `vehicleTags` contains `KeepMovingPrice` (= "Great Deal", priced below KBB) and `RecentPriceDrop`.
 - `price.kbbValue` is present per listing — useful for deal comparison.
@@ -364,7 +372,7 @@ This section is the canonical reference for which endpoints work from Node's `fe
 
 ### Zippopotam.us ZIP geocoder (2026-05-15)
 
-- `GET https://api.zippopotam.us/us/{zip}`. Free, public, undocumented. No auth, no cookies. Returns `{ places: [{ latitude, longitude, ... }] }` for valid ZIPs, **HTTP 404 for unknown**. Used by `src/zipDistance.js` to compute haversine distance for the Cars.com radius post-filter. **Not blocked** in our tests. Same fragility class as the other free endpoints — wrapped fail-open at the call site.
+- `GET https://api.zippopotam.us/us/{zip}`. Free, public, undocumented. No auth, no cookies. Returns `{ places: [{ latitude, longitude, ... }] }` for valid ZIPs, **HTTP 404 for unknown**. Used by `src/zipDistance.js` to compute haversine distance for the Cars.com radius post-filter. **Not blocked** in our tests. Same fragility class as the other free endpoints — lookup failures keep Cars.com listings only when the radius is implicit; an explicit radius drops unverifiable listings.
 
 ### The Zebra calculator (2026-05-15)
 
@@ -403,7 +411,7 @@ Cars.com 403 is a normal status check.
 - `src/feeClient.js` — `lookupSalesTax(zip)` against TaxJar's widget calculator. Returns `{combinedRate, stateRate, countyRate, cityRate, districtRate, state, county, city}` with per-process per-ZIP cache.
 - `src/feeData.js` — static state-level tables: EV annual surcharge and registration estimate. Source URLs in the file header.
 - `src/loanCalculator.js` — pure `monthlyPayment(...)`, `parsePrice(...)`, and `totalCostBreakdown(...)` (the integration helper that finances tax into principal and amortizes annual fees).
-- `src/zipDistance.js` — `getZipCoords(zip)` + `distanceMiles(zipA, zipB)` against Zippopotam.us (free, no auth, undocumented). In-memory cache for the process lifetime. Used by `fetchCarscom` to post-filter out-of-radius listings. Fail-open: lookup failures keep the listing rather than drop it.
+- `src/zipDistance.js` — `getZipCoords(zip)` + `distanceMiles(zipA, zipB)` against Zippopotam.us (free, no auth, undocumented). In-memory cache for the process lifetime. Used by `fetchCarscom` to post-filter out-of-radius listings. Lookup failures keep listings with the implicit default radius, but drop them when `searchRadius` is explicit.
 - `src/scraper.js` — Puppeteer + `puppeteer-extra-plugin-stealth` HTML scrapers for Cars.com, Autotrader, KBB, and CarGurus (`scrapeCarGurus`, Puppeteer-only — no fetch tier). Each call launches its own browser. Exports `CarListing` class.
 - `src/cargurusReference.js` — resolves make/model names to CarGurus's internal `makeId`/`modelId` codes via `resolveMakeModel(page, make, model)`. Takes a caller-supplied already-open Puppeteer `page` since the reference endpoints are DataDome-blocked to plain fetch same as the rest of cargurus.com. Non-throwing on a miss; per-process caches for makes and per-makeId models.
 - `test/` — `node:test` suite, runs offline, ~230ms. See "Tests" below.
@@ -420,16 +428,16 @@ Cars.com 403 is a normal status check.
 
 ## Tests
 
-`npm run test:unit` runs the full `node:test` suite (`node --test test/*.test.js`). 177 tests, fully offline, ~230ms. Files:
+`npm run test:unit` runs the full `node:test` suite (`node --test test/*.test.js`). 204 tests, fully offline. Files:
 
 - `test/loanCalculator.test.js` — pure math, edge cases, `totalCostBreakdown` (tax-financed-into-principal, EV surcharge gating, default down-payment ratio).
 - `test/insuranceClient.test.js` — Zebra request body shape, HTML rate parsing, median for odd/even counts, fallback to top-level `rate`, error paths.
 - `test/feeClient.test.js` — TaxJar URL construction, response parsing, per-ZIP cache, OR zero-rate handling, error paths.
 - `test/feeData.test.js` — every state present in both tables, values are non-negative integers, case-insensitive lookups.
-- `test/apiClient.test.js` — `fetchAutotrader` (URL/QS construction, `vhrPreview`, post-filter, model-code prefixing, body/fuel mapping, dealRating mapping, AkamaiBlockError), `fetchKbb` (Cox shape variations, channel=KBB, KBB-specific URL host, dealType post-filter), `fetchCarscom` (filter construction, `analytics.context`, auth-failure retry, body/fuel slugs, **radius post-filter drops out-of-range seller ZIPs, fail-open on unresolvable / missing ZIPs**), `fetchCarmax` (uri slug construction, make/model/body/fuel segments, maxResults, error paths), `fetchCarvana` (request body filters, make+parentModels shape, dealRating from vehicleTags, error paths).
-- `test/zipDistance.test.js` — `haversineMiles` correctness, `getZipCoords` parsing/caching/404/input validation, `distanceMiles` short-circuit + fail-open behavior.
+- `test/apiClient.test.js` — `fetchAutotrader` (URL/QS construction, `vhrPreview`, post-filter, model-code prefixing, body/fuel mapping, dealRating mapping, AkamaiBlockError), `collectCoxListings` (later-page `{}` retains earlier listings, first-page `{}` and other malformed pages throw, deep-result partitioning), `fetchKbb` (Cox shape variations, channel=KBB, KBB-specific URL host, dealType post-filter), `fetchCarscom` (filter construction, `analytics.context`, auth-failure retry, body/fuel slugs, **radius post-filter drops out-of-range seller ZIPs; unresolvable / missing ZIPs are dropped for explicit radius, kept for implicit radius**), `fetchCarmax` (uri slug construction, make/model/body/fuel segments, maxResults, error paths), `fetchCarvana` (request body filters, make+parentModels shape, dealRating from vehicleTags, error paths).
+- `test/zipDistance.test.js` — `haversineMiles` correctness, `getZipCoords` parsing/caching/404/input validation, `distanceMiles` short-circuit and null on lookup failure. The helper leaves the keep/drop decision to `fetchCarscom`: keep unverifiable listings with an implicit radius, drop them with an explicit radius (covered in `test/apiClient.test.js`).
 - `test/cargurusReference.test.js` — `resolveMakeModel` against a fake Puppeteer `page` (a stub exposing just `.goto()`/`.evaluate()`, since this module has no fetch path to mock `global.fetch` against): make+model hit, case/spacing insensitivity, make-miss short-circuiting the model lookup, model-miss within a known make, null inputs, malformed-JSON handling, and makes-index caching across calls.
-- `test/server.test.js` — orchestration: fetch success, 0-listings → Puppeteer fallback, fetch throws → fallback, both fail → `{error}` envelope, KBB and CarGurus fetch/scrape paths. Stubs `apiClient`/`scraper`/`insuranceClient`/`loanCalculator`/`feeClient`/`feeData` via `require.cache` priming **before** loading `server.js` (the destructured imports at the top of server.js capture function references at load time — mutating the fake exports after the require has no effect).
+- `test/server.test.js` — orchestration: fetch success, zero-listing success without fallback, fetch throws → fallback when filters are verifiable, both fail → `{error}` envelope, KBB and CarGurus fetch/scrape paths. Stubs `apiClient`/`scraper`/`insuranceClient`/`loanCalculator`/`feeClient`/`feeData` via `require.cache` priming **before** loading `server.js` (the destructured imports at the top of server.js capture function references at load time — mutating the fake exports after the require has no effect).
 
 `npm test` is still the live Puppeteer Cars.com smoke. Don't run it in CI.
 
@@ -445,7 +453,7 @@ Cars.com 403 is a normal status check.
 
 1. **Cold-start race in `getCarscomApiKey()`.** Race between Puppeteer's request listener and the page firing a `graph.cars.com` POST. Hits ~10% of cold starts. Fix: also bind a `response` listener and read the same headers — first one to fire wins. Not yet done.
 2. **No retry/backoff on Autotrader Akamai block.** If it ever does block undici, we go straight to Puppeteer. That's fine for correctness, but adding a 1s + 5s backoff before fallback would let transient blocks recover faster.
-3. **Cars.com response shape didn't expose CARFAX flags.** We trust the server-side filter (verified working). If that filter ever silently breaks, we'd return wrong results without knowing. A future probe of the GraphQL schema (via introspection or HAR re-capture) could expose the badge fields and let us double-check post-fetch.
+3. **Cars.com lacks verifiable per-listing history flags.** `oneOwner`/`noAccidents` requests exclude Cars.com; `personalUse` relies on the server-side filter without a per-listing verification field. A future GraphQL/HAR probe could expose usable badge data.
 4. **The Zebra calculator endpoint is undocumented.** Same fragility class as the cars.com / autotrader fetches — they could change the body shape, add auth, or rate-limit. `estimateInsurance` is wrapped in `.catch` at the call site so failure degrades gracefully (listings still render with loan-only payments).
 5. **Cars.com / Autotrader body & fuel filter values weren't exercised in the recorded HARs.** We inferred slug/code names from URL params and JS bundles. If queries return 0 listings unexpectedly, double-check the slug/code mappings in `CARS_BODY_STYLE_SLUGS` / `AT_BODY_STYLE_CODES` etc. in `src/apiClient.js`.
 6. **TaxJar widget endpoint is undocumented.** Same posture as the other fetches — could break. Wrapped in `.catch`; failure removes the tax line and zeroes the financed-tax adjustment. Output downgrades cleanly to "loan + insurance" only.

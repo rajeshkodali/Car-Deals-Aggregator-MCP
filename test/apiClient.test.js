@@ -107,7 +107,7 @@ test('fetchAutotrader builds the expected URL/params and parses listings', async
     assert.ok(captured.url.startsWith('https://www.autotrader.com/collections/lcServices/rest/lsc/listing?'));
     const qs = new URL(captured.url).searchParams;
     assert.equal(qs.get('zip'), '98101');
-    assert.equal(qs.get('numRecords'), '5');
+    assert.equal(qs.get('numRecords'), '10', 'post-filtered searches inspect extra candidate rows');
     assert.equal(qs.get('searchRadius'), '75');
     assert.equal(qs.get('makeCode'), 'TOYOTA');
     // Cox model codes follow no rule — looked up against searchoptions reference.
@@ -118,6 +118,97 @@ test('fetchAutotrader builds the expected URL/params and parses listings', async
     assert.equal(qs.get('maxMileage'), '60000');
     assert.equal(qs.get('keywordPhrases'), 'hybrid');
     assert.equal(qs.get('listingTypes'), 'USED');
+});
+
+test('fetchKbb paginates past an initial page with no strict matches', async () => {
+    const { fetchKbb } = loadFreshApiClient();
+    const offsets = [];
+    const candidate = (id, drive) => ({
+        id, year: 2024, pricingDetail: { salePrice: 25000 },
+        fuelType: { group: 'Electric' },
+        specifications: { driveType: { value: drive } },
+        vhrPreview: ['ONE_OWNER', 'NO_ACCIDENTS_REPORTED']
+    });
+    await withFetchStub(async url => {
+        const offset = Number(new URL(url).searchParams.get('firstRecord') || 0);
+        offsets.push(offset);
+        return makeFetchResponse({ body: {
+            totalResultCount: 6,
+            listings: offset === 0
+                ? [0, 1, 2, 3].map(i => candidate(`RWD${i}`, 'Rear Wheel Drive'))
+                : [candidate('AWD1', 'All Wheel Drive'), candidate('AWD2', 'All Wheel Drive')]
+        } });
+    }, async () => {
+        const out = await fetchKbb({ zip: '98033', fuelType: 'ev', driveType: 'awd', oneOwner: true, noAccidents: true }, 2);
+        assert.deepEqual(out.map(l => l.url), [
+            'https://www.kbb.com/cars-for-sale/vehicledetails.xhtml?listingId=AWD1',
+            'https://www.kbb.com/cars-for-sale/vehicledetails.xhtml?listingId=AWD2'
+        ]);
+    });
+    assert.deepEqual(offsets, [0, 4]);
+});
+
+test('Cox collector retains earlier listings when a later page is an empty object', async () => {
+    const { collectCoxListings } = loadFreshApiClient();
+    const offsets = [];
+    const out = await collectCoxListings(
+        new URLSearchParams({ numRecords: '2' }),
+        async query => {
+            const offset = Number(query.get('firstRecord') || 0);
+            offsets.push(offset);
+            if (offset === 4) return {};
+            return {
+                totalResultCount: 10,
+                listings: [offset, offset + 1].map(id => ({ id: `L${id}`, pricingDetail: { salePrice: 25000 } }))
+            };
+        },
+        { source: 'KBB', vdpBase: 'https://www.kbb.com/cars-for-sale/vehicledetails.xhtml' },
+        {}, 10
+    );
+    assert.deepEqual(out.map(l => l.url.split('listingId=')[1]), ['L0', 'L1', 'L2', 'L3']);
+    assert.deepEqual(offsets, [0, 2, 4]);
+});
+
+test('Cox collector rejects an empty object on the first page', async () => {
+    const { collectCoxListings } = loadFreshApiClient();
+    await assert.rejects(collectCoxListings(
+        new URLSearchParams({ numRecords: '2' }), async () => ({}),
+        { source: 'KBB', vdpBase: 'https://www.kbb.com/cars-for-sale/vehicledetails.xhtml' },
+        {}, 10
+    ), /missing listings array/);
+});
+
+test('Cox collector rejects other malformed later pages', async () => {
+    const { collectCoxListings } = loadFreshApiClient();
+    for (const malformed of [null, [], { error: 'schema changed' }, { listings: null }]) {
+        await assert.rejects(collectCoxListings(
+            new URLSearchParams({ numRecords: '1' }),
+            async query => query.has('firstRecord') ? malformed : {
+                totalResultCount: 2, listings: [{ id: 'A', pricingDetail: { salePrice: 25000 } }]
+            },
+            { source: 'KBB', vdpBase: 'https://www.kbb.com/cars-for-sale/vehicledetails.xhtml' },
+            {}, 10
+        ), /missing listings array at offset 1/);
+    }
+});
+
+test('Cox collector splits a result set that exceeds the deep-page limit', async () => {
+    const { collectCoxListings } = loadFreshApiClient();
+    const queries = [];
+    const row = (id, price) => ({ id, year: 2023, pricingDetail: { salePrice: price } });
+    const out = await collectCoxListings(
+        new URLSearchParams({ startYear: '2023', endYear: '2023', maxPrice: '1000', numRecords: '100' }),
+        async query => {
+            queries.push(query.toString());
+            if (query.get('minPrice') === '501') return { totalResultCount: 2, listings: [row('C', 600), row('D', 700)] };
+            if (query.get('maxPrice') === '500') return { totalResultCount: 2, listings: [row('A', 300), row('B', 400)] };
+            return { totalResultCount: 301, listings: [row('A', 300)] };
+        },
+        { source: 'KBB', vdpBase: 'https://www.kbb.com/cars-for-sale/vehicledetails.xhtml' },
+        { yearMin: 2023, priceMax: 1000 }, 10
+    );
+    assert.deepEqual(out.map(l => l.url.split('listingId=')[1]), ['A', 'B', 'C', 'D']);
+    assert.equal(queries.length, 3);
 });
 
 test('fetchAutotrader resolves model name "EV6" via Cox reference -> KIAEV6', async () => {
@@ -199,6 +290,25 @@ test('fetchAutotrader post-filters when oneOwner/noAccidents/personalUse request
     });
 });
 
+test('fetchKbb verifies EV, AWD, and history from Cox listing fields', async () => {
+    const { fetchKbb } = loadFreshApiClient();
+    const flags = ['ONE_OWNER', 'NO_ACCIDENTS_REPORTED'];
+    const listings = [
+        { id: 'AWD-EV', fuelType: { code: 'E', group: 'Electric' }, specifications: { driveType: { value: 'All Wheel Drive' } }, vhrPreview: flags, owner: { homeServices: { vehicleDelivery: true } } },
+        { id: 'RWD-EV', fuelType: { code: 'E', group: 'Electric' }, specifications: { driveType: { value: 'Rear Wheel Drive' } }, vhrPreview: flags },
+        { id: 'AWD-GAS', fuelType: { code: 'G', group: 'Gasoline' }, specifications: { driveType: { value: 'All Wheel Drive' } }, vhrPreview: flags },
+        { id: 'NO-HISTORY', fuelType: { code: 'E', group: 'Electric' }, specifications: { driveType: { value: 'All Wheel Drive' } }, vhrPreview: [] }
+    ];
+    await withFetchStub(async () => makeFetchResponse({ body: { listings } }), async () => {
+        const out = await fetchKbb({ zip: '98033', fuelType: 'ev', driveType: 'awd', oneOwner: true, noAccidents: true }, 50);
+        assert.deepEqual(out.map(l => l.url.split('listingId=')[1]), ['AWD-EV']);
+        assert.equal(out[0].fuelType, 'electric');
+        assert.equal(out[0].driveType, 'awd');
+        assert.equal(out[0].deliveryOffered, true);
+        assert.match(out[0].format(), /Dealer offers delivery \(confirm destination ZIP\)/);
+    });
+});
+
 test('fetchAutotrader honours maxResults after filtering', async () => {
     const { fetchAutotrader } = loadFreshApiClient();
     const body = { listings: Array.from({ length: 25 }, (_, i) => ({ id: `L${i}`, vhrPreview: [] })) };
@@ -235,6 +345,13 @@ test('fetchAutotrader throws when response is not JSON', async () => {
         async () => {
             await assert.rejects(fetchAutotrader({ zip: '90210' }, 5), /non-JSON/);
         });
+});
+
+test('fetchAutotrader rejects a JSON response without listings so fallback can run', async () => {
+    const { fetchAutotrader } = loadFreshApiClient();
+    await withFetchStub(async () => makeFetchResponse({ body: { unexpected: [] } }), async () => {
+        await assert.rejects(fetchAutotrader({ zip: '98033' }, 5), /missing listings array/);
+    });
 });
 
 test('isAkamaiBlock detects the sentinel string only', () => {
@@ -688,6 +805,28 @@ test('fetchCarscom throws on non-JSON body', async () => {
         });
 });
 
+test('fetchCarscom rejects a response without results so browser fallback can run', async () => {
+    const apiClient = loadFreshApiClient();
+    apiClient.getCarscomApiKey = async () => 'K';
+    await withFetchStub(async () => makeFetchResponse({ body: { data: { srpSearch: {} } } }), async () => {
+        await assert.rejects(apiClient.fetchCarscom({ zip: '98033' }, 5), /missing results array/);
+    });
+});
+
+test('fetchCarscom excludes non-electric listings from an EV search', async () => {
+    const apiClient = loadFreshApiClient();
+    apiClient.getCarscomApiKey = async () => 'K';
+    stubZipDistance(apiClient);
+    const results = [
+        { __typename: 'SrpListingGridCard', listingId: 'EV', analytics: { context: JSON.stringify({ year: 2024, price: 25000, fuel_type: 'Electric', seller: { zip: '98033' } }) } },
+        { __typename: 'SrpListingGridCard', listingId: 'GAS', analytics: { context: JSON.stringify({ year: 2024, price: 25000, fuel_type: 'Gasoline', seller: { zip: '98033' } }) } }
+    ];
+    await withFetchStub(async () => makeFetchResponse({ body: { data: { srpSearch: { results } } } }), async () => {
+        const out = await apiClient.fetchCarscom({ zip: '98033', fuelType: 'ev', yearMin: 2023, priceMax: 27500 }, 50);
+        assert.deepEqual(out.map(l => l.url), ['https://www.cars.com/vehicledetail/EV/']);
+    });
+});
+
 test('fetchCarscom honours maxResults', async () => {
     const apiClient = loadFreshApiClient();
     apiClient.getCarscomApiKey = async () => 'K';
@@ -797,7 +936,7 @@ test('fetchCarscom drops listings outside searchRadius via post-filter', async (
     });
 });
 
-test('fetchCarscom keeps listings when distance is unresolvable (fail-open)', async () => {
+test('fetchCarscom drops unverifiable distances when radius is explicit', async () => {
     const apiClient = loadFreshApiClient();
     apiClient.getCarscomApiKey = async () => 'K';
     // Simulate Zippopotam being unreachable / unknown ZIP — distanceMiles returns null.
@@ -813,7 +952,7 @@ test('fetchCarscom keeps listings when distance is unresolvable (fail-open)', as
 
     await withFetchStub(async () => makeFetchResponse({ body }), async () => {
         const out = await fetchCarscom({ zip: '98033', searchRadius: 100 }, 10);
-        assert.equal(out.length, 1, 'unresolvable distance should fail-open and keep the listing');
+        assert.equal(out.length, 0, 'an explicit local radius needs a verifiable distance');
     });
 });
 
@@ -930,6 +1069,27 @@ test('fetchCarmax honours maxResults', async () => {
     await withFetchStub(async () => makeFetchResponse({ body: { items } }), async () => {
         const out = await fetchCarmax({ zip: '90210' }, 7);
         assert.equal(out.length, 7);
+    });
+});
+
+test('fetchCarmax enforces one-owner, EV, and AWD from listing fields', async () => {
+    const { fetchCarmax } = loadFreshApiClient();
+    const items = [
+        { stockNumber: 1, highlights: ['singleOwner'], engineType: 'Electric', driveTrain: 'All Wheel Drive' },
+        { stockNumber: 2, highlights: [], engineType: 'Electric', driveTrain: 'All Wheel Drive' },
+        { stockNumber: 3, highlights: ['singleOwner'], engineType: 'Gas', driveTrain: 'All Wheel Drive' },
+        { stockNumber: 4, highlights: ['singleOwner'], engineType: 'Electric', driveTrain: 'Rear Wheel Drive' }
+    ];
+    await withFetchStub(async () => makeFetchResponse({ body: { items } }), async () => {
+        const out = await fetchCarmax({ zip: '98033', oneOwner: true, fuelType: 'ev', driveType: 'awd' }, 10);
+        assert.deepEqual(out.map(l => l.url), ['https://www.carmax.com/car/1']);
+    });
+});
+
+test('fetchCarmax rejects a response without items so HTML fallback can run', async () => {
+    const { fetchCarmax } = loadFreshApiClient();
+    await withFetchStub(async () => makeFetchResponse({ body: { totalCount: 10 } }), async () => {
+        await assert.rejects(fetchCarmax({ zip: '98033' }, 5), /missing items array/);
     });
 });
 
@@ -1118,6 +1278,27 @@ test('fetchCarvana builds the expected request body and parses vehicles', async 
     assert.ok(body.requestedFeatures.includes('ExcludeFacetData'));
 });
 
+test('fetchCarvana verifies EV, year, and price from returned vehicles', async () => {
+    const { fetchCarvana } = loadFreshApiClient();
+    const vehicles = [
+        { vehicleId: 1, year: 2024, price: { total: 25000 }, fuelType: 'Electric' },
+        { vehicleId: 2, year: 2022, price: { total: 25000 }, fuelType: 'Electric' },
+        { vehicleId: 3, year: 2024, price: { total: 28000 }, fuelType: 'Electric' },
+        { vehicleId: 4, year: 2024, price: { total: 25000 }, fuelType: 'Gas' }
+    ];
+    await withFetchStub(async () => makeFetchResponse({ body: { inventory: { vehicles } } }), async () => {
+        const out = await fetchCarvana({ zip: '98033', yearMin: 2023, priceMax: 27500, fuelType: 'ev' }, 50);
+        assert.deepEqual(out.map(l => l.url), ['https://www.carvana.com/vehicle/1']);
+    });
+});
+
+test('fetchCarvana reports a missing vehicles array as a source failure', async () => {
+    const { fetchCarvana } = loadFreshApiClient();
+    await withFetchStub(async () => makeFetchResponse({ body: { inventory: {} } }), async () => {
+        await assert.rejects(fetchCarvana({ zip: '98033' }, 5), /missing vehicles array/);
+    });
+});
+
 test('fetchCarvana resolves user model casing to Carvana canonical (e.g. "ioniq 5" -> "IONIQ 5")', async () => {
     const { fetchCarvana } = loadFreshApiClient();
     let body = null;
@@ -1232,7 +1413,7 @@ test('fetchCarvana throws on non-JSON', async () => {
     });
 });
 
-test('fetchCarscom keeps listings when seller.zip is missing (fail-open)', async () => {
+test('fetchCarscom drops listings without seller ZIP when radius is explicit', async () => {
     const apiClient = loadFreshApiClient();
     apiClient.getCarscomApiKey = async () => 'K';
     let distanceCalls = 0;
@@ -1246,7 +1427,7 @@ test('fetchCarscom keeps listings when seller.zip is missing (fail-open)', async
 
     await withFetchStub(async () => makeFetchResponse({ body }), async () => {
         const out = await fetchCarscom({ zip: '98033', searchRadius: 100 }, 10);
-        assert.equal(out.length, 1, 'no seller zip → keep listing without checking distance');
+        assert.equal(out.length, 0, 'no seller ZIP means local distance cannot be verified');
         assert.equal(distanceCalls, 0, 'should not call distanceMiles when seller zip is missing');
     });
 });

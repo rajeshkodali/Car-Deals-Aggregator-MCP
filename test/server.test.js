@@ -121,6 +121,39 @@ function loadServerWithStubs({ api = {}, scraper = {}, insurance, loan, fees } =
 
 // ---------- searchCarscom ----------
 
+test('handleSearchCarDeals starts every selected source before combining results', async () => {
+    const started = [];
+    const pending = new Map();
+    function worker(source) {
+        return async () => {
+            started.push(source);
+            return new Promise(resolve => pending.set(source, resolve));
+        };
+    }
+    const { server, restoreLogs } = loadServerWithStubs({
+        api: {
+            fetchCarscom: worker('Cars.com'),
+            fetchAutotrader: worker('Autotrader'),
+            fetchKbb: worker('KBB'),
+            fetchCarmax: worker('CarMax'),
+            fetchCarvana: worker('Carvana')
+        },
+        scraper: { scrapeCarGurus: worker('CarGurus') }
+    });
+    try {
+        const search = server.handleSearchCarDeals({
+            zip: '98033', sources: ['cars.com', 'autotrader', 'kbb', 'carmax', 'carvana', 'cargurus'],
+            includeEstimates: false
+        });
+        assert.deepEqual(started, ['Cars.com', 'Autotrader', 'KBB', 'CarMax', 'Carvana', 'CarGurus']);
+        for (const [source, resolve] of pending) {
+            resolve([makeListing({ source, url: `https://example.com/${source}` })]);
+        }
+        const out = await search;
+        assert.match(out.content[0].text, /Found \*\*6\*\* listings/);
+    } finally { restoreLogs(); }
+});
+
 test('searchCarscom returns fetch results when fetchCarscom yields listings', async () => {
     let scraperCalls = 0;
     const { server, restoreLogs } = loadServerWithStubs({
@@ -161,6 +194,20 @@ test('searchCarscom falls back to scraper when fetch throws', async () => {
         const out = await server.searchCarscom({ zip: '90210' }, 5);
         assert.equal(out.listings.length, 1);
         assert.equal(out.listings[0].title, 'fallback');
+    } finally { restoreLogs(); }
+});
+
+test('searchCarscom does not return unverifiable HTML cards for an EV search', async () => {
+    let scraperCalls = 0;
+    const { server, restoreLogs } = loadServerWithStubs({
+        api: { fetchCarscom: async () => { throw new Error('GraphQL blocked'); } },
+        scraper: { scrapeCarscom: async () => { scraperCalls += 1; return [makeListing()]; } }
+    });
+    try {
+        const out = await server.searchCarscom({ zip: '98033', fuelType: 'ev', searchRadius: 200 }, 50);
+        assert.deepEqual(out.listings, []);
+        assert.match(out.error, /HTML fallback cannot verify requested filters/);
+        assert.equal(scraperCalls, 0);
     } finally { restoreLogs(); }
 });
 
@@ -215,6 +262,23 @@ test('searchAutotrader falls back to scraper when fetch throws (e.g. Akamai)', a
         const out = await server.searchAutotrader({ zip: '90210' }, 5);
         assert.equal(out.listings.length, 1);
         assert.equal(out.error, undefined);
+    } finally { restoreLogs(); }
+});
+
+test('searchAutotrader falls back to browser Cox data for strict filters', async () => {
+    let scraperCalls = 0;
+    const { server, restoreLogs } = loadServerWithStubs({
+        api: { fetchAutotrader: async () => { throw new Error('blocked'); } },
+        scraper: { scrapeAutotrader: async () => {
+            scraperCalls += 1;
+            return [makeListing({ fuelType: 'electric', driveType: 'awd', isOneOwner: true, noAccidents: true })];
+        } }
+    });
+    try {
+        const out = await server.searchAutotrader({ zip: '98033', fuelType: 'ev', oneOwner: true, noAccidents: true, driveType: 'awd' }, 50);
+        assert.equal(out.listings.length, 1);
+        assert.equal(out.error, undefined);
+        assert.equal(scraperCalls, 1);
     } finally { restoreLogs(); }
 });
 
@@ -291,6 +355,18 @@ test('searchCarGurus swallows scraper errors and returns an empty envelope', asy
         const out = await server.searchCarGurus({ zip: '90210' }, 5);
         assert.equal(out.source, 'CarGurus');
         assert.deepEqual(out.listings, []);
+        assert.match(out.error, /cargurus down/);
+    } finally { restoreLogs(); }
+});
+
+test('searchCarvana reports API failures instead of a clean empty result', async () => {
+    const { server, restoreLogs } = loadServerWithStubs({
+        api: { fetchCarvana: async () => { throw new Error('Carvana response missing vehicles array'); } }
+    });
+    try {
+        const out = await server.searchCarvana({ zip: '98033' }, 5);
+        assert.deepEqual(out.listings, []);
+        assert.match(out.error, /missing vehicles array/);
     } finally { restoreLogs(); }
 });
 
@@ -377,6 +453,23 @@ test('searchKBB falls back to scraper when fetchKbb throws', async () => {
         assert.equal(out.listings.length, 1);
         assert.equal(out.listings[0].title, 'pup');
         assert.equal(out.error, undefined);
+    } finally { restoreLogs(); }
+});
+
+test('searchKBB falls back to browser Cox data for strict filters', async () => {
+    let scraperCalls = 0;
+    const { server, restoreLogs } = loadServerWithStubs({
+        api: { fetchKbb: async () => { throw new Error('blocked'); } },
+        scraper: { scrapeKBB: async () => {
+            scraperCalls += 1;
+            return [makeListing({ fuelType: 'electric', driveType: 'awd', isOneOwner: true, noAccidents: true })];
+        } }
+    });
+    try {
+        const out = await server.searchKBB({ zip: '98033', fuelType: 'ev', oneOwner: true, noAccidents: true, driveType: 'awd' }, 50);
+        assert.equal(out.listings.length, 1);
+        assert.equal(out.error, undefined);
+        assert.equal(scraperCalls, 1);
     } finally { restoreLogs(); }
 });
 
@@ -470,6 +563,7 @@ test('searchCarmax returns empty envelope when both API and HTML fail', async ()
         const out = await server.searchCarmax({ zip: '90210' }, 5);
         assert.equal(out.source, 'CarMax');
         assert.deepEqual(out.listings, []);
+        assert.match(out.error, /HTML fallback failed \(html down\)/);
     } finally { restoreLogs(); }
 });
 
@@ -608,6 +702,27 @@ test('handleSearchCarDeals skips CarMax for noAccidents but keeps it for oneOwne
     } finally { restoreLogs(); }
 });
 
+test('handleSearchCarDeals skips nationwide inventory for an explicit local radius', async () => {
+    let carmaxCalls = 0;
+    let carvanaCalls = 0;
+    const { server, restoreLogs } = loadServerWithStubs({
+        api: {
+            fetchCarmax: async () => { carmaxCalls += 1; return []; },
+            fetchCarvana: async () => { carvanaCalls += 1; return []; }
+        }
+    });
+    try {
+        const out = await server.handleSearchCarDeals({
+            zip: '98033', searchRadius: 200, sources: ['carmax', 'carvana'], includeEstimates: false
+        });
+        assert.equal(carmaxCalls, 0);
+        assert.equal(carvanaCalls, 0);
+        assert.match(out.content[0].text, /carmax: searchRadius=200 not enforceable/);
+        assert.match(out.content[0].text, /carvana: searchRadius=200 not enforceable/);
+        assert.match(out.content[0].text, /No selected sources can verify all requested filters/);
+    } finally { restoreLogs(); }
+});
+
 test('handleSearchCarDeals skips Cars.com for oneOwner/noAccidents (ghost-result gotcha)', async () => {
     // Cars.com returns a ghost (totalListings=0, empty context) when
     // one_owner / no_accidents are sent in the GraphQL filters, so
@@ -706,5 +821,22 @@ test('handleSearchCarDeals reports per-source errors in trailing Errors section'
         const text = out.content[0].text;
         assert.match(text, /\*\*Errors:\*\*/);
         assert.match(text, /Autotrader: puppeteer unavailable in CI/);
+    } finally { restoreLogs(); }
+});
+
+test('handleSearchCarDeals distinguishes failed sources from an empty search', async () => {
+    const { server, restoreLogs } = loadServerWithStubs({
+        api: { fetchKbb: async () => { throw new Error('network blocked'); } },
+        scraper: { scrapeKBB: async () => { throw new Error('browser unavailable'); } }
+    });
+    try {
+        const out = await server.handleSearchCarDeals({
+            zip: '98033', sources: ['kbb'], fuelType: 'ev', driveType: 'awd',
+            oneOwner: true, noAccidents: true, includeEstimates: false
+        });
+        assert.match(out.content[0].text, /Search could not be completed/);
+        assert.doesNotMatch(out.content[0].text, /No listings found/);
+        assert.match(out.content[0].text, /KBB: browser unavailable/);
+        assert.equal(out.isError, true);
     } finally { restoreLogs(); }
 });

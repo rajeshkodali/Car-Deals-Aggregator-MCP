@@ -38,12 +38,16 @@ class CarListing {
         this.batteryHealthRating = data.batteryHealthRating ?? null;
         this.batteryHealthLabel = data.batteryHealthLabel || null;
         // Drivetrain, only populated where a source exposes a real structured
-        // field (currently CarMax's `driveTrain`). Values: 'awd' | 'rwd' |
+        // field (Cox specifications.driveType, CarMax driveTrain, CarGurus).
+        // Values: 'awd' | 'rwd' |
         // 'fwd' | '4wd' | null. Do NOT infer this from trim name (e.g.
         // "SEL"/"Limited") — verified live 2026-09-03 that CarMax sells both
         // AWD and RWD SE trims, so trim name does not reliably indicate
         // drivetrain on any source. null means the source didn't expose it.
         this.driveType = data.driveType || null;
+        // Dealer advertises vehicle delivery on this listing. The source does
+        // not confirm delivery eligibility for a particular destination ZIP.
+        this.deliveryOffered = data.deliveryOffered === true;
     }
 
     format() {
@@ -64,6 +68,7 @@ class CarListing {
         }
 
         if (this.driveType) result += `\n  Drivetrain: ${this.driveType.toUpperCase()}`;
+        if (this.deliveryOffered) result += `\n  Dealer offers delivery (confirm destination ZIP)`;
 
         if (this.dealerName) result += `\n  Dealer: ${this.dealerName}`;
         if (this.location) result += `\n  Location: ${this.location}`;

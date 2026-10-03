@@ -109,12 +109,8 @@ function normalizeFuelType(raw) {
     return null;
 }
 
-// CarMax's `driveTrain` field ("All Wheel Drive", "Rear Wheel Drive", "Front
-// Wheel Drive", "Four Wheel Drive") is the only source in this codebase that
-// exposes real structured drivetrain data — Autotrader/KBB, Cars.com, and
-// Carvana have no equivalent field (verified live 2026-09-03 against a raw
-// Carvana vehicle payload: no drivetrain key at all). Do NOT infer drivetrain
-// from trim name elsewhere — CarMax's own data shows SE trims can be AWD.
+// Cox listings expose specifications.driveType.value; CarMax exposes driveTrain.
+// Do not infer drivetrain from trim names: the same trim can be AWD or RWD.
 function normalizeDriveType(raw) {
     if (raw == null) return null;
     const k = String(raw).toLowerCase().replace(/[\s\-]+/g, '_');
@@ -135,7 +131,12 @@ function normalizeDriveType(raw) {
 async function buildCoxListingQuery(params, maxResults) {
     const qs = new URLSearchParams();
     qs.set('zip', params.zip || '90210');
-    qs.set('numRecords', String(Math.min(Math.max(maxResults, 1), 100)));
+    // Owner/accident flags are filtered after retrieval, so asking for only
+    // maxResults raw rows can hide matching cars farther down the first page.
+    const hasPostFilters = params.oneOwner || params.noAccidents || params.personalUse ||
+        params.driveType || params.fuelType || params.yearMin || params.yearMax || params.priceMax;
+    const requestedRecords = hasPostFilters ? maxResults * 2 : maxResults;
+    qs.set('numRecords', String(Math.min(Math.max(requestedRecords, 1), 100)));
     qs.set('searchRadius', String(params.searchRadius || 50));
     qs.set('sortBy', params.sortBy || 'relevance');
     if (params.make) {
@@ -183,7 +184,8 @@ function mapCoxListing(l, flavor) {
     const url = l.id ? `${flavor.vdpBase}?listingId=${l.id}` : null;
     // fuelType is reported under `fuelType.code` (e.g. "ELE", "PIH", "HYB",
     // "GSL", "DSL") on Cox listings. Some shapes use `fuelType.name`.
-    const rawFuel = l.fuelType?.code || l.fuelType?.name || l.fuelType;
+    // Cox can use a one-letter code ("E") while group/name spells out Electric.
+    const rawFuel = l.fuelType?.group || l.fuelType?.name || l.fuelType?.code || l.fuelType;
     // Only present on EV/PHEV listings. Sourced from Manheim's fleet-average
     // condition data (see healthRating/healthDescription in the raw payload),
     // not a per-VIN sensor reading.
@@ -202,31 +204,32 @@ function mapCoxListing(l, flavor) {
         noAccidents: vhr.includes('NO_ACCIDENTS_REPORTED'),
         personalUse: vhr.includes('PERSONAL_USE'),
         fuelType: normalizeFuelType(rawFuel),
+        driveType: normalizeDriveType(l.specifications?.driveType?.value || l.driveType?.name || l.driveType?.code || l.driveType),
+        deliveryOffered: l.owner?.homeServices?.vehicleDelivery === true,
         batteryHealthRating: typeof battery?.healthRating === 'number' ? battery.healthRating : null,
         batteryHealthLabel: battery?.healthDescription || null
     });
 }
 
-async function fetchCoxListings(url, flavor, params, maxResults) {
-    const res = await fetchWithTimeout(url, {
-        headers: {
-            'user-agent': UA,
-            'accept': '*/*',
-            'accept-language': 'en-US,en;q=0.9',
-            'referer': flavor.referer
-        }
-    }, { timeoutMs: FETCH_TIMEOUT_MS, label: flavor.source });
-    const text = await res.text();
-    if (res.status !== 200) throw new Error(`${flavor.source} HTTP ${res.status}`);
-    if (isAkamaiBlock(text)) throw new AkamaiBlockError(flavor.source);
-    let data;
-    try { data = JSON.parse(text); } catch { throw new Error(`${flavor.source} returned non-JSON`); }
-    const raw = Array.isArray(data.listings) ? data.listings : [];
+function parseCoxListings(data, flavor, params, maxResults) {
+    if (!data || !Array.isArray(data.listings)) {
+        throw new Error(`${flavor.source} listing response missing listings array`);
+    }
+    let raw = data.listings;
+    const listingYear = l => Number(l.year ?? l.title?.match(/\b(?:19|20)\d{2}\b/)?.[0]);
+    if (params.yearMin) raw = raw.filter(l => listingYear(l) >= params.yearMin);
+    if (params.yearMax) raw = raw.filter(l => listingYear(l) <= params.yearMax);
+    if (params.priceMax) raw = raw.filter(l => {
+        const price = Number(l.pricingDetail?.salePrice);
+        return price > 0 && price <= params.priceMax;
+    });
     let mapped = raw.map(l => mapCoxListing(l, flavor));
     // Server-side flags are unreliable on this endpoint; post-filter.
     if (params.oneOwner) mapped = mapped.filter(l => l.isOneOwner);
     if (params.noAccidents) mapped = mapped.filter(l => l.noAccidents);
     if (params.personalUse) mapped = mapped.filter(l => l.personalUse);
+    if (params.driveType) mapped = mapped.filter(l => l.driveType === params.driveType);
+    if (params.fuelType === 'ev') mapped = mapped.filter(l => l.fuelType === 'electric');
     // Defense in depth on dealRating: if the caller asked for great/good and
     // the server returned mixed results anyway, drop the rest. Cox's per-listing
     // rating is "Great" / "Good" (capitalized) in priceBadge.label or
@@ -234,6 +237,95 @@ async function fetchCoxListings(url, flavor, params, maxResults) {
     if (params.dealRating === 'great') mapped = mapped.filter(l => /great/i.test(l.dealRating || ''));
     else if (params.dealRating === 'good') mapped = mapped.filter(l => /good/i.test(l.dealRating || ''));
     return mapped.slice(0, maxResults);
+}
+
+async function collectCoxListings(baseQuery, loadPage, flavor, params, maxResults) {
+    const pageSize = Number(baseQuery.get('numRecords'));
+    const listings = [];
+    const seen = new Set();
+    const seenRaw = new Set();
+    function append(data, offset) {
+        const page = parseCoxListings(data, flavor, params, maxResults);
+        const rawIds = data.listings.map(l => l.id).filter(id => id != null);
+        const repeated = offset > 0 && rawIds.length > 0 && rawIds.every(id => seenRaw.has(id));
+        for (const id of rawIds) seenRaw.add(id);
+        for (const listing of page) {
+            if (seen.has(listing.url)) continue;
+            seen.add(listing.url);
+            listings.push(listing);
+            if (listings.length >= maxResults) break;
+        }
+        return repeated;
+    }
+
+    async function collect(query) {
+        if (listings.length >= maxResults) return;
+        const first = await loadPage(query);
+        // An unexpected first-page shape is a source failure. Only a later
+        // page's empty object is treated as Cox's deep-pagination limit.
+        if (!Array.isArray(first?.listings)) throw new Error(`${flavor.source} listing response missing listings array`);
+        const total = Number(first.totalResultCount);
+        // Live Cox queries return {} at deep offsets despite a larger total.
+        // Partition large result sets before paging. Exact year and min/max
+        // price filters were verified against the live endpoint.
+        if (Number.isFinite(total) && total > 300) {
+            const lowYear = Number(query.get('startYear') || 1970);
+            const highYear = Number(query.get('endYear') || new Date().getFullYear() + 2);
+            if (lowYear < highYear) {
+                const middle = Math.floor((lowYear + highYear) / 2);
+                const left = new URLSearchParams(query);
+                const right = new URLSearchParams(query);
+                left.set('endYear', String(middle));
+                right.set('startYear', String(middle + 1));
+                await collect(left);
+                await collect(right);
+                return;
+            }
+            const lowPrice = Number(query.get('minPrice') || 0);
+            const highPrice = Number(query.get('maxPrice') || 1000000);
+            if (lowPrice >= highPrice) throw new Error(`${flavor.source} result set exceeds pagination limit`);
+            const middle = Math.floor((lowPrice + highPrice) / 2);
+            const left = new URLSearchParams(query);
+            const right = new URLSearchParams(query);
+            left.set('maxPrice', String(middle));
+            right.set('minPrice', String(middle + 1));
+            await collect(left);
+            await collect(right);
+            return;
+        }
+        append(first, 0);
+        for (let offset = pageSize; listings.length < maxResults; offset += pageSize) {
+            if (first.listings.length < pageSize || (Number.isFinite(total) && offset >= total)) break;
+            const nextQuery = new URLSearchParams(query);
+            nextQuery.set('firstRecord', String(offset));
+            const data = await loadPage(nextQuery);
+            if (data && !Array.isArray(data) && typeof data === 'object' && Object.keys(data).length === 0) break;
+            if (!Array.isArray(data?.listings)) throw new Error(`${flavor.source} listing response missing listings array at offset ${offset}`);
+            const repeated = append(data, offset);
+            if (data.listings.length < pageSize || repeated) break;
+        }
+    }
+    await collect(baseQuery);
+    return listings;
+}
+
+async function fetchCoxListings(url, flavor, params, maxResults) {
+    const pageUrl = new URL(url);
+    return collectCoxListings(pageUrl.searchParams, async query => {
+        pageUrl.search = query.toString();
+        const res = await fetchWithTimeout(pageUrl.toString(), {
+            headers: {
+                'user-agent': UA,
+                'accept': '*/*',
+                'accept-language': 'en-US,en;q=0.9',
+                'referer': flavor.referer
+            }
+        }, { timeoutMs: FETCH_TIMEOUT_MS, label: flavor.source });
+        const body = await res.text();
+        if (res.status !== 200) throw new Error(`${flavor.source} HTTP ${res.status}`);
+        if (isAkamaiBlock(body)) throw new AkamaiBlockError(flavor.source);
+        try { return JSON.parse(body); } catch { throw new Error(`${flavor.source} returned non-JSON`); }
+    }, flavor, params, maxResults);
 }
 
 async function fetchAutotrader(params, maxResults = 20) {
@@ -342,9 +434,8 @@ function buildCarscomFilters(params) {
     if (params.yearMax) filters.push({ filter: 'year_max', value: String(params.yearMax) });
     if (params.keyword) filters.push({ filter: 'keyword', value: params.keyword });
     // one_owner and no_accidents server-side filters are not sent: Cars.com returns a
-    // near-empty ghost result (totalListings=0, context={}) when these are included,
-    // which drops all real listings. We propagate the caller's intent into listing flags
-    // (isOneOwner/noAccidents on lines below) so the output still reflects the request.
+    // near-empty ghost result (totalListings=0, context={}) when these are included.
+    // The orchestrator excludes Cars.com when either history flag is required.
     if (params.personalUse) filters.push({ filter: 'personal_use', value: 'true' });
     if (params.dealRating) filters.push({ filter: 'deal_ratings', values: [params.dealRating] });
     if (params.bodyStyle) {
@@ -412,12 +503,18 @@ async function fetchCarscom(params, maxResults = 20) {
     try { data = JSON.parse(text); } catch { throw new Error('Cars.com returned non-JSON'); }
     if (data.errors) throw new Error(`Cars.com GraphQL errors: ${JSON.stringify(data.errors).slice(0, 200)}`);
 
-    const results = data.data?.srpSearch?.results || [];
+    const results = data.data?.srpSearch?.results;
+    if (!Array.isArray(results)) throw new Error('Cars.com response missing results array');
     const candidates = [];
     for (const r of results) {
         if (r.__typename !== 'SrpListingGridCard') continue;
         let ctx = {};
         try { ctx = JSON.parse(r.analytics?.context || '{}'); } catch {}
+        if (params.yearMin && !(Number(ctx.year) >= params.yearMin)) continue;
+        if (params.yearMax && !(Number(ctx.year) <= params.yearMax)) continue;
+        if (params.priceMax && !(Number(ctx.price) > 0 && Number(ctx.price) <= params.priceMax)) continue;
+        if (params.mileageMax && !(Number(ctx.mileage) >= 0 && Number(ctx.mileage) <= params.mileageMax)) continue;
+        if (params.fuelType && normalizeFuelType(ctx.fuel_type) !== normalizeFuelType(params.fuelType)) continue;
         const title = [ctx.year, ctx.make, ctx.model, ctx.trim].filter(Boolean).join(' ') || null;
         const price = ctx.price ? `$${Number(ctx.price).toLocaleString()}` : null;
         const mileage = ctx.mileage ? `${Number(ctx.mileage).toLocaleString()} mi.` : null;
@@ -449,14 +546,14 @@ async function fetchCarscom(params, maxResults = 20) {
 
     // Cars.com's server-side `area` filter occasionally leaks listings far outside
     // the requested radius (observed 1000+ miles away on real queries). Post-filter
-    // by haversine distance from params.zip. Fail-open: if either ZIP can't be
-    // resolved, keep the listing rather than drop it.
+    // by haversine distance from params.zip. For an explicit hard radius, an
+    // unresolvable seller ZIP cannot be verified and must be dropped.
     const radius = Number(params.searchRadius) || 50;
     const searchZip = String(params.zip || '').trim();
     const withDistance = await Promise.all(candidates.map(async c => {
-        if (!searchZip || !c.sellerZip) return { keep: true, c };
+        if (!searchZip || !c.sellerZip) return { keep: params.searchRadius == null, c };
         const d = await module.exports._zipDistance.distanceMiles(searchZip, c.sellerZip);
-        if (d == null) return { keep: true, c }; // unresolvable — keep
+        if (d == null) return { keep: params.searchRadius == null, c };
         return { keep: d <= radius, c, d };
     }));
 
@@ -522,6 +619,18 @@ function mapCarmaxItem(item) {
     });
 }
 
+function filterCarmaxListings(items, params, maxResults) {
+    let raw = items;
+    if (params.yearMin) raw = raw.filter(item => Number(item.year) >= params.yearMin);
+    if (params.yearMax) raw = raw.filter(item => Number(item.year) <= params.yearMax);
+    if (params.priceMax) raw = raw.filter(item => Number(item.basePrice) > 0 && Number(item.basePrice) <= params.priceMax);
+    let listings = raw.map(mapCarmaxItem);
+    if (params.oneOwner) listings = listings.filter(l => l.isOneOwner);
+    if (params.driveType) listings = listings.filter(l => l.driveType === params.driveType);
+    if (params.fuelType) listings = listings.filter(l => l.fuelType === normalizeFuelType(params.fuelType));
+    return listings.slice(0, maxResults);
+}
+
 async function fetchCarmax(params, maxResults = 20) {
     const uri = buildCarmaxUri(params);
     const qs = new URLSearchParams({
@@ -547,8 +656,9 @@ async function fetchCarmax(params, maxResults = 20) {
     if (res.status !== 200) throw new Error(`CarMax HTTP ${res.status}`);
     let data;
     try { data = JSON.parse(text); } catch { throw new Error('CarMax returned non-JSON'); }
-    const items = Array.isArray(data.items) ? data.items : [];
-    return items.slice(0, maxResults).map(mapCarmaxItem);
+    if (!Array.isArray(data.items)) throw new Error('CarMax response missing items array');
+    const items = data.items;
+    return filterCarmaxListings(items, params, maxResults);
 }
 
 // HTML fallback: parse the SRP page's embedded `const cars = [...]` JS array.
@@ -583,7 +693,7 @@ async function fetchCarmaxFromHtml(params, maxResults = 20) {
     let arr;
     try { arr = JSON.parse(m[1]); } catch (e) { throw new Error(`CarMax HTML cars[] parse failed: ${e.message}`); }
     if (!Array.isArray(arr)) throw new Error('CarMax HTML cars[] not an array');
-    return arr.slice(0, maxResults).map(mapCarmaxItem);
+    return filterCarmaxListings(arr, params, maxResults);
 }
 
 // Carvana: POST /merch/search/api/v2/search
@@ -691,7 +801,15 @@ async function fetchCarvana(params, maxResults = 20) {
     if (res.status !== 200) throw new Error(`Carvana HTTP ${res.status}`);
     let data;
     try { data = JSON.parse(text); } catch { throw new Error('Carvana returned non-JSON'); }
-    const vehicles = Array.isArray(data.inventory?.vehicles) ? data.inventory.vehicles : [];
+    if (!Array.isArray(data.inventory?.vehicles)) throw new Error('Carvana response missing vehicles array');
+    let vehicles = data.inventory.vehicles;
+    if (params.yearMin) vehicles = vehicles.filter(v => Number(v.year) >= params.yearMin);
+    if (params.yearMax) vehicles = vehicles.filter(v => Number(v.year) <= params.yearMax);
+    if (params.priceMax) vehicles = vehicles.filter(v => {
+        const price = Number(v.price?.total ?? v.price);
+        return price > 0 && price <= params.priceMax;
+    });
+    if (params.fuelType) vehicles = vehicles.filter(v => normalizeFuelType(v.fuelType) === normalizeFuelType(params.fuelType));
     return vehicles.slice(0, maxResults).map(v => {
         const title = [v.year, v.make, v.model, v.trim].filter(Boolean).join(' ') || null;
         const rawPrice = v.price?.total ?? v.price;
@@ -734,6 +852,9 @@ module.exports = {
     // with no fetch/puppeteer dependency either way.
     normalizeFuelType,
     normalizeDriveType,
+    buildCoxListingQuery,
+    parseCoxListings,
+    collectCoxListings,
     // Re-exported via module.exports so tests can stub distanceMiles without
     // launching real HTTP calls. Same pattern as getCarscomApiKey.
     _zipDistance: zipDistance
