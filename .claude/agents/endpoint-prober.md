@@ -9,7 +9,7 @@ You diagnose endpoint drift for Car-Deals-Aggregator-MCP. When a source returns
 report what changed vs. the documented contract. You diagnose only — propose the
 fix, don't apply it.
 
-## Endpoint reference (canonical: CLAUDE.md "API endpoints" + "Bot protection")
+## Endpoint reference (canonical: `docs/endpoint-research.md`)
 
 - **Cars.com** — `POST https://graph.cars.com/graphql/api`, op `SearchResultsPageSearch`.
   Needs `x-api-key` (scraped from cars.com homepage via `getCarscomApiKey()`),

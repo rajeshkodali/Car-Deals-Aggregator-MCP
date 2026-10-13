@@ -2,10 +2,10 @@
 
 This repository is a CommonJS, Node 22+ MCP server for searching car listings.
 Read [CLAUDE.md](CLAUDE.md) for search defaults, source capabilities, fallback
-policies, result presentation, and endpoint research. Keep those details there
-as the shared reference rather than duplicating them in this file. When older
-research conflicts with current behavior, verify `src/` and `test/` and update
-CLAUDE.md alongside the implementation.
+policies, and result presentation. Read
+[docs/endpoint-research.md](docs/endpoint-research.md) for external endpoint
+research. When research conflicts with current behavior, verify `src/` and
+`test/`, then update the appropriate reference with the implementation.
 
 ## Commands
 
