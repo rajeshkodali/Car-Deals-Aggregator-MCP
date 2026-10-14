@@ -17,8 +17,8 @@ The source and offline tests are authoritative if older research conflicts.
 
 Always show one full, plain `https://...` URL per listing row. Never hide it behind link text.
 
-- For duplicate marketplace inventory, choose Cars.com, then Autotrader, then KBB.
-- Do not duplicate a car solely because it appears on another source.
+- Deduplicate only matching Autotrader/KBB listings by `listingId`, preferring Autotrader.
+- Keep listings from all other sources separate, even when the same car appears on another source.
 - The plain-terminal check: a reader must see the actual URL rather than only `Link`.
 - Default searches include all six sources (`cars.com`, `autotrader`, `kbb`, `carmax`, `carvana`, `cargurus`) and use `maxResults >= 50`, unless the user requests otherwise.
 - Hard constraints determine eligibility: explicit `searchRadius` excludes CarMax and Carvana; `driveType` excludes Cars.com and Carvana. Surface source-exclusion caveats.
