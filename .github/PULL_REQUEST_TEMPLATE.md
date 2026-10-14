@@ -25,7 +25,7 @@
 
 - [ ] No HARs, `.env` files, or other captures committed (`*.har` is gitignored)
 - [ ] No real seller/dealer PII, VINs, or ZIP codes in committed test fixtures
-- [ ] CLAUDE.md updated when an external API endpoint, schema, or anti-bot
-      behavior changes (this is the canonical reference for future Claude runs)
+- [ ] `docs/endpoint-research.md` updated when an external API endpoint, schema,
+      or anti-bot behavior changes
 - [ ] New `fetch` calls don't include cookies, auth tokens, or session IDs
       from a personal browser
