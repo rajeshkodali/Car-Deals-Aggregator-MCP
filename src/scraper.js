@@ -11,7 +11,7 @@ const cargurusReference = require('./cargurusReference.js');
 // vocabulary as every other source instead of duplicating the mapping.
 // apiClient.js itself has no puppeteer dependency, so this doesn't pull
 // puppeteer in anywhere it wasn't already.
-const { normalizeFuelType, normalizeDriveType, buildCoxListingQuery, collectCoxListings, isAkamaiBlock } = require('./apiClient.js');
+const { normalizeFuelType, normalizeDriveType, buildCoxListingQuery, collectCoxListings, isAkamaiBlock, buildCarmaxUri, filterCarmaxListings } = require('./apiClient.js');
 const { parsePrice } = require('./loanCalculator.js');
 
 function parseMileageStr(s) {
@@ -645,6 +645,40 @@ async function scrapeCarGurus(params, maxResults = 20) {
 }
 
 /**
+ * Scrape CarMax via Puppeteer. Third-tier fallback for when both the JSON
+ * API (fetchCarmax) and the plain-fetch HTML fallback (fetchCarmaxFromHtml)
+ * are blocked with HTTP 403. Same SSR `const cars = [...]` payload as
+ * fetchCarmaxFromHtml, but rendered through a real Chromium session so the
+ * edge bot gate sees a browser instead of a Node fetch.
+ */
+async function scrapeCarMax(params, maxResults = 20) {
+    let browser;
+    try {
+        browser = await launchBrowser();
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1920, height: 1080 });
+        const uri = buildCarmaxUri(params);
+        const sep = uri.includes('?') ? '&' : '?';
+        const url = `https://www.carmax.com${uri}${sep}zipCode=${encodeURIComponent(params.zip || '90210')}&distance=${params.searchRadius || 50}`;
+        const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        if (!response || response.status() !== 200) {
+            throw new Error(`CarMax HTTP ${response ? response.status() : 'no response'}`);
+        }
+        const html = await page.content();
+        const m = html.match(/const cars\s*=\s*(\[[\s\S]*?\]);/);
+        if (!m) throw new Error('CarMax page missing embedded cars[]');
+        let arr;
+        try { arr = JSON.parse(m[1]); } catch (e) { throw new Error(`CarMax cars[] parse failed: ${e.message}`); }
+        if (!Array.isArray(arr)) throw new Error('CarMax cars[] not an array');
+        await browser.close();
+        return filterCarmaxListings(arr, params, maxResults);
+    } catch (err) {
+        if (browser) await browser.close().catch(() => {});
+        throw new Error(`CarMax scraping failed: ${err.message}`);
+    }
+}
+
+/**
  * Search all sources and combine results
  */
 async function searchAllSources(params, maxResultsPerSource = 10) {
@@ -687,6 +721,7 @@ module.exports = {
     scrapeAutotrader,
     scrapeKBB,
     scrapeCarGurus,
+    scrapeCarMax,
     filterCarGurusListings,
     buildCarGurusSearchUrl,
     searchAllSources
