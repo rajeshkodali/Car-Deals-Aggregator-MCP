@@ -14,7 +14,7 @@ const {
     ListToolsRequestSchema,
 } = require('@modelcontextprotocol/sdk/types.js');
 
-const { scrapeCarscom, scrapeAutotrader, scrapeKBB, scrapeCarGurus } = require('./scraper.js');
+const { scrapeCarscom, scrapeAutotrader, scrapeKBB, scrapeCarGurus, scrapeCarMax } = require('./scraper.js');
 const { fetchAutotrader, fetchCarscom, fetchKbb, fetchCarmax, fetchCarmaxFromHtml, fetchCarvana } = require('./apiClient.js');
 const { estimateInsurance } = require('./insuranceClient.js');
 const { monthlyPayment, parsePrice, totalCostBreakdown } = require('./loanCalculator.js');
@@ -179,6 +179,7 @@ async function searchKBB(params, maxResults) {
 
 async function searchCarmax(params, maxResults) {
     let fetchError;
+    let htmlError;
     try {
         const listings = await fetchCarmax(params, maxResults);
         console.error(`[MCP] CarMax fetch: ${listings.length} listings`);
@@ -192,8 +193,16 @@ async function searchCarmax(params, maxResults) {
         console.error(`[MCP] CarMax HTML fallback: ${listings.length} listings`);
         return { source: 'CarMax', listings };
     } catch (err) {
-        console.error(`[MCP] CarMax HTML fallback failed (${err.message})`);
-        return { source: 'CarMax', listings: [], error: `API failed (${fetchError.message}); HTML fallback failed (${err.message})` };
+        htmlError = err;
+        console.error(`[MCP] CarMax HTML fallback failed (${err.message}), trying Puppeteer`);
+    }
+    try {
+        const listings = await scrapeCarMax(params, maxResults);
+        console.error(`[MCP] CarMax Puppeteer fallback: ${listings.length} listings`);
+        return { source: 'CarMax', listings };
+    } catch (err) {
+        console.error(`[MCP] CarMax Puppeteer fallback failed (${err.message})`);
+        return { source: 'CarMax', listings: [], error: `API failed (${fetchError.message}); HTML fallback failed (${htmlError.message}); Puppeteer failed (${err.message})` };
     }
 }
 

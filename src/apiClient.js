@@ -855,6 +855,8 @@ module.exports = {
     buildCoxListingQuery,
     parseCoxListings,
     collectCoxListings,
+    buildCarmaxUri,
+    filterCarmaxListings,
     // Re-exported via module.exports so tests can stub distanceMiles without
     // launching real HTTP calls. Same pattern as getCarscomApiKey.
     _zipDistance: zipDistance
